@@ -29,14 +29,14 @@
     "clean": "rm -rf contracts/aztec/target contracts/l1/out contracts/l1/cache src/generated .tsbuildinfo"
   },
   "dependencies": {
-    "@aztec/accounts": "5.0.0-nightly.20260601",
-    "@aztec/aztec.js": "5.0.0-nightly.20260601",
-    "@aztec/constants": "5.0.0-nightly.20260601",
-    "@aztec/ethereum": "5.0.0-nightly.20260601",
-    "@aztec/foundation": "5.0.0-nightly.20260601",
-    "@aztec/l1-artifacts": "5.0.0-nightly.20260601",
-    "@aztec/stdlib": "5.0.0-nightly.20260601",
-    "@aztec/wallets": "5.0.0-nightly.20260601",
+    "@aztec/accounts": "5.0.0-rc.1",
+    "@aztec/aztec.js": "5.0.0-rc.1",
+    "@aztec/constants": "5.0.0-rc.1",
+    "@aztec/ethereum": "5.0.0-rc.1",
+    "@aztec/foundation": "5.0.0-rc.1",
+    "@aztec/l1-artifacts": "5.0.0-rc.1",
+    "@aztec/stdlib": "5.0.0-rc.1",
+    "@aztec/wallets": "5.0.0-rc.1",
     "viem": "npm:@aztec/viem@2.38.2"
   },
   "optionalDependencies": {

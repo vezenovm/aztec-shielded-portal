@@ -22,7 +22,7 @@ pub contract TornadoEthToken {
             functions::{external, initializer, view},
             storage::storage,
         },
-        messages::message_delivery::MessageDelivery,
+        messages::delivery::MessageDelivery,
         protocol::{
             address::{AztecAddress, EthAddress},
             hash::poseidon2_hash,

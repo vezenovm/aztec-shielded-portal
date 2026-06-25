@@ -87,7 +87,7 @@ scripts/                   deploy-l1 / deploy-aztec / demo-flow
 
 ## Toolchain & version pinning
 
-Everything pins to one nightly — **`5.0.0-nightly.20260601`** — across the sandbox CLI,
+Everything pins to one nightly — **`5.0.0-rc.1`** — across the sandbox CLI,
 `@aztec/*` npm packages, and the `aztec-nr` git tag in `Nargo.toml`. The L1 contracts
 import Aztec core interfaces (`IInbox`, `IOutbox`, `Hash`, `DataStructures`) and
 forge-std straight out of the **`@aztec/l1-artifacts` npm package** (see
@@ -96,8 +96,8 @@ forge-std straight out of the **`@aztec/l1-artifacts` npm package** (see
 Prerequisites: Node 22+, Yarn 4 (corepack), Foundry, and
 
 ```bash
-aztec-up install 5.0.0-nightly.20260601
-aztec --version   # must print 5.0.0-nightly.20260601
+aztec-up install 5.0.0-rc.1
+aztec --version   # must print 5.0.0-rc.1
 ```
 
 ## Quickstart
