@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "mv/**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Build + offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install the Aztec toolchain (5.0.0-rc.1)
+        run: |
+          curl -fsSL https://install.aztec.network | bash
+          echo "$HOME/.aztec/bin" >> "$GITHUB_PATH"
+      - name: Pin aztec 5.0.0-rc.1
+        run: aztec-up install 5.0.0-rc.1
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Build (noir compile + codegen + forge build + tsc)
+        run: yarn build
+
+      - name: L1 unit tests (Foundry)
+        run: yarn test:l1
+
+      - name: SDK unit tests
+        run: yarn test:sdk
+
+      - name: Aztec TXE unit tests
+        run: yarn test:aztec-unit
+
+# Intentionally NOT run in CI:
+#   - yarn test:aztec / yarn test:e2e  -> require `aztec start --local-network` (heavyweight); run locally.
+#   - yarn test:fork                   -> requires a BYO tornado-cli (old, untrusted third-party
+#                                         toolchain) + a mainnet fork. Operator-run only. See SECURITY.md.

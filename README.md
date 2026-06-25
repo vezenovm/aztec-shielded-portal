@@ -123,10 +123,20 @@ yarn deploy:l1              # pool + bridge -> config.local.json
 yarn deploy:aztec           # tornadoETH + bridge.initialize
 ```
 
-There is no separate `portal` CLI in this PoC. The public lifecycle surface is the TS
-SDK plus the runnable `yarn demo` walkthrough; a CLI would mostly duplicate the SDK and
-force state/artifact UX decisions that are deferred until the integration surface is
-more settled.
+### CLI
+
+`yarn portal <command>` is a thin wrapper over the SDK that persists state to
+`config.local.json`, so you can walk the whole lifecycle by hand:
+
+```bash
+yarn portal setup [--real]            # deploy + wire the stack (mock pool, or the forwarder path)
+yarn portal generate-secret           # print a fresh mint secret
+yarn portal generate-commitment --recipient <addr> --secret <s> [--amount <wei>]
+yarn portal withdraw-to-portal [--recipient <idx|addr>]      # pool -> bridge (locks ETH, messages L2)
+yarn portal claim [--deposit <idx>] [--recipient <idx|addr>] # mint private tornadoETH
+yarn portal transfer --to <addr> --amount <wei> [--from <idx|addr>]
+yarn portal burn --recipient-l1 <0x> --amount <wei> [--from <idx|addr>] [--redeem]
+```
 
 Note on L2→L1 redemption locally: the local network does no real proving; its
 `EpochTestSettler` pushes each completed epoch's out-hash into the L1 Outbox (epoch =
@@ -192,6 +202,43 @@ privateKey })`, connect to Aztec with `connectToAztec(AZTEC_NODE_URL)`, deploy o
 helpers. Commitment helpers (`generateMintSecret`, `computeAztecMintCommitment`) are
 also exported for callers that need to split commitment generation from the L1 pool
 withdrawal.
+
+## Real Tornado (Classic) integration
+
+The default pool is a mock. The repo also ships an adapter for **real Tornado Cash Classic** (the
+fixed-denomination pools, e.g. the 1 ETH pool `0x47CE…2936`). Real Tornado pays the recipient via a
+plain `recipient.call{value}("")` with no calldata, so it can't carry an Aztec commitment.
+
+**Binding (Option B — CREATE2 forwarder).** The commitment is welded into the proof-bound
+`recipient`: `recipient = CREATE2(factory, salt = aztecMintCommitment)`. A per-commitment `Forwarder`
+is deployed there, receives exactly the denomination, and calls the portal — which re-derives that
+address and matches it against `msg.sender`. Swapping the commitment changes `recipient`, which
+invalidates the Tornado proof. The portal keeps a **dual-path** ingress: the existing approved-pool
+path (mock + all current tests stay green) *and* the approved-forwarder-factory path.
+
+**Proving is delegated, not vendored.** Tornado Classic's mainnet verifier only accepts
+circom1/websnark proofs from its exact trusted setup, so `proveViaTornadoCli` (`src/real-tornado.ts`)
+shells out to a **caller-supplied** `tornado-cli` checkout via `scripts/tornado-prove.cjs`. Nothing
+from Tornado Cash is committed to this repo.
+
+| Tier | What | Proves | Runs |
+| ---- | ---- | ------ | ---- |
+| 1 | forwarder unit tests vs a real-mimicking mock pool | handoff, reentrancy, binding | `yarn test:l1` (offline) |
+| 2 | mainnet-fork vs the real pool bytecode, verifier mocked | whole surface except proof validity | forge fork test (gated) |
+| 3 | our own `ETHTornado` on a fork vs the **real verifier** | the real verifier accepts our proof packing | `yarn test:fork` (operator) |
+| 4 | Sepolia tornado-core + Aztec testnet | live, end-to-end | Phase 4 (scaffolded) |
+
+**Running Tier 3** (operator-only — see [SECURITY.md](./SECURITY.md)):
+
+```bash
+git clone https://github.com/tornadocash/tornado-cli && (cd tornado-cli && npm install)
+anvil --fork-url "$MAINNET_RPC_URL"        # in a separate terminal
+TORNADO_CLI_DIR=/abs/path/to/tornado-cli L1_RPC_URL=http://localhost:8545 yarn rehearsal:real-tornado
+```
+
+This deploys our own `ETHTornado` on the fork pointed at the real on-chain verifier, deposits a leaf
+we own, generates a real proof bound to the forwarder, and asserts the bridge locked the denomination
+— no real funds, no mainnet leaf history needed.
 
 ## Deviations from the spec
 
