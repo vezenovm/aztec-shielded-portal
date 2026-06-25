@@ -39,11 +39,6 @@
     "@aztec/wallets": "5.0.0-rc.1",
     "viem": "npm:@aztec/viem@2.38.2"
   },
-  "optionalDependencies": {
-    "circomlibjs": "^0.1.7",
-    "fixed-merkle-tree": "^0.7.3",
-    "snarkjs": "^0.7.4"
-  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
