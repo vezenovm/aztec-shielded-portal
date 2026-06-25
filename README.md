@@ -1,4 +1,6 @@
-# aztec-shielded-portal — Tornado → Aztec bridge PoC
+# aztec-shielded-portal 
+
+## Tornado → Aztec bridge PoC
 
 A proof-of-concept bridge that lets a user withdraw ETH from a Tornado Cash pool into an
 Ethereum L1 bridge contract, then mint a private Aztec note representing **`tornadoETH`** —
