@@ -1,0 +1,10 @@
+node_modules/
+.yarn/
+contracts/aztec/target/
+contracts/l1/out/
+contracts/l1/cache/
+src/generated/
+codegenCache.json
+config.local.json
+.tsbuildinfo
+*.log

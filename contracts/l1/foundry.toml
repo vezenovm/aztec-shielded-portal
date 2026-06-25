@@ -1,0 +1,25 @@
+# Solc/EVM settings mirror @aztec/l1-artifacts' l1-contracts foundry.toml so our
+# bridge compiles identically to the Aztec core contracts it links against.
+[profile.default]
+src = 'src'
+test = 'test'
+out = 'out'
+libs = []
+solc_version = "0.8.30"
+evm_version = 'prague'
+optimizer = true
+optimizer_runs = 200
+match_path = "test/**/*.t.sol"
+# Aztec core interfaces/libraries + forge-std come straight from the npm package,
+# keeping the Solidity side version-locked to 5.0.0-nightly.20260601.
+allow_paths = ["../../node_modules"]
+remappings = [
+  "@aztec/=../../node_modules/@aztec/l1-artifacts/l1-contracts/src/",
+  "@oz/=../../node_modules/@aztec/l1-artifacts/l1-contracts/lib/openzeppelin-contracts/contracts/",
+  "forge-std/=../../node_modules/@aztec/l1-artifacts/l1-contracts/lib/forge-std/src/",
+]
+
+# Fork tests (test/fork/*.t.sol) read MAINNET_RPC_URL. They self-skip when it is unset, so the
+# default `forge test` stays fully offline; run them explicitly with `yarn test:l1:fork`.
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"
