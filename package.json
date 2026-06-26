@@ -22,6 +22,7 @@
     "test:e2e": "node --import tsx --test test/e2e.test.ts",
     "test:fork": "node --import tsx --test test/fork/real-tornado.fork.test.ts",
     "rehearsal:real-tornado": "tsx scripts/real-tornado-rehearsal.ts",
+    "rehearsal:sepolia": "tsx scripts/sepolia-rehearsal.ts",
     "deploy:l1": "tsx scripts/deploy-l1.ts",
     "deploy:aztec": "tsx scripts/deploy-aztec.ts",
     "demo": "tsx scripts/demo-flow.ts",
