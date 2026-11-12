@@ -1,6 +1,6 @@
 /**
  * ABI/bytecode exports for the L1 contracts, sourced from the Foundry build output
- * (`yarn build:l1` must have run). Mirrors how @aztec/l1-artifacts exposes its contracts.
+ * (`yarn build:l1` must have run). Mirrors how @aztec-foundation/l1-artifacts exposes its contracts.
  */
 import type { Abi } from 'viem';
 

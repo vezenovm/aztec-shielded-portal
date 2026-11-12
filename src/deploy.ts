@@ -11,18 +11,19 @@
  */
 import { readFileSync } from 'node:fs';
 
-import type { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
-import { createAztecNodeClient } from '@aztec/aztec.js/node';
-import { createExtendedL1Client } from '@aztec/ethereum/client';
-import { OutboxContract } from '@aztec/ethereum/contracts';
-import { deployL1Contract } from '@aztec/ethereum/deploy-l1-contract';
-import { EthAddress } from '@aztec/foundation/eth-address';
-import { retryUntil } from '@aztec/foundation/retry';
-import { computeL2ToL1MembershipWitness } from '@aztec/stdlib/messaging';
-import type { TxReceipt } from '@aztec/stdlib/tx';
-import { EmbeddedWallet } from '@aztec/wallets/embedded';
-import { registerInitialLocalNetworkAccountsInWallet } from '@aztec/wallets/testing';
+import type { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { Fr } from '@aztec-labs/aztec.js/fields';
+import { isL1ToL2MessageReady } from '@aztec-labs/aztec.js/messaging';
+import { createAztecNodeClient } from '@aztec-labs/aztec.js/node';
+import { createExtendedL1Client } from '@aztec-labs/ethereum/client';
+import { OutboxContract } from '@aztec-labs/ethereum/contracts';
+import { deployL1Contract } from '@aztec-labs/ethereum/deploy-l1-contract';
+import { EthAddress } from '@aztec-labs/foundation/eth-address';
+import { retryUntil } from '@aztec-labs/foundation/retry';
+import { computeL2ToL1MembershipWitness } from '@aztec-labs/stdlib/messaging';
+import type { MinedTxReceipt, TxReceipt } from '@aztec-labs/stdlib/tx';
+import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
+import { registerInitialLocalNetworkAccountsInWallet } from '@aztec-labs/wallets/testing';
 import { defineChain, parseAbi, parseEventLogs, type Abi, type Chain } from 'viem';
 import { foundry } from 'viem/chains';
 
@@ -189,6 +190,22 @@ export async function connectToAztec(nodeUrl = AZTEC_NODE_URL): Promise<AztecCon
     throw new Error('Expected prefunded local-network accounts — is `aztec start --local-network` running?');
   }
   return { node, wallet, accounts };
+}
+
+/**
+ * Attach to an already-deployed tornadoETH from a fresh wallet: fetch the instance from the node
+ * and register it with the artifact (a new PXE knows nothing about contracts it did not deploy).
+ */
+export async function loadTornadoEthToken(
+  conn: Pick<AztecConnection, 'node' | 'wallet'>,
+  address: AztecAddress,
+): Promise<TornadoEthTokenContract> {
+  const instance = await conn.node.getContract(address);
+  if (!instance) {
+    throw new Error(`No contract deployed at ${address.toString()} -- stale state from an earlier network? Re-run setup.`);
+  }
+  await conn.wallet.registerContract(instance, TornadoEthTokenContract.artifact);
+  return TornadoEthTokenContract.at(address, conn.wallet);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -398,21 +415,7 @@ export async function withdrawFromTornadoToBridge(
   };
 }
 
-/** Wait until the archiver has indexed the L1->L2 message. */
-export async function waitForMessageSeen(node: AztecNode, messageHash: Fr, timeoutSec = 90): Promise<void> {
-  await retryUntil(
-    async () => (await node.getL1ToL2MessageCheckpoint(messageHash)) !== undefined,
-    `L1->L2 message ${messageHash.toString()} indexed`,
-    timeoutSec,
-    1,
-  );
-}
-
-/**
- * Progress the rollup by `blocks` L2 blocks using no-op self-transfers. An L1->L2
- * message becomes consumable two blocks after insertion (one for subtree inclusion,
- * one for tree availability) — mirrors the canonical harness's makeMessageConsumable.
- */
+/** Progress the rollup by `blocks` L2 blocks using no-op self-transfers. */
 export async function advanceL2Blocks(
   token: TornadoEthTokenContract,
   account: AztecAddress,
@@ -423,14 +426,36 @@ export async function advanceL2Blocks(
   }
 }
 
-/** Make a deposit's L1->L2 message consumable: wait for indexing + 2 L2 blocks. */
+/**
+ * Make a deposit's L1->L2 message consumable: produce L2 blocks until one has inserted the
+ * message into the L1->L2 message tree (Inbox buckets make the exact block count timing-dependent).
+ */
 export async function makeMessageConsumable(
   stack: Pick<BridgeStack, 'node' | 'token'>,
   deposit: TornadoDeposit,
   account: AztecAddress,
+  timeoutSec = 180,
 ): Promise<void> {
-  await waitForMessageSeen(stack.node, deposit.messageHash);
-  await advanceL2Blocks(stack.token, account, 2);
+  await retryUntil(
+    async () => {
+      if (await isL1ToL2MessageReady(stack.node, deposit.messageHash)) {
+        return true;
+      }
+      await advanceL2Blocks(stack.token, account, 1);
+      return false;
+    },
+    `L1->L2 message ${deposit.messageHash.toString()} consumable`,
+    timeoutSec,
+    1,
+  );
+}
+
+/** Narrow a tx receipt to a mined one; pending/dropped receipts carry no block position. */
+export function assertMined(receipt: TxReceipt): MinedTxReceipt {
+  if (!receipt.isMined()) {
+    throw new Error(`Tx ${receipt.txHash.toString()} is not mined (status: ${receipt.status}).`);
+  }
+  return receipt;
 }
 
 /** Claim the deposit as private tornadoETH notes for `recipient` (the tx sender). */
@@ -439,7 +464,7 @@ export async function claimTornadoEth(
   recipient: AztecAddress,
   deposit: TornadoDeposit,
   overrides: { amount?: bigint; mintSecret?: Fr } = {},
-): Promise<TxReceipt> {
+): Promise<MinedTxReceipt> {
   const { receipt } = await token.methods
     .claim_from_tornado_bridge(
       Fr.fromHexString(deposit.depositId),
@@ -448,7 +473,7 @@ export async function claimTornadoEth(
       deposit.messageLeafIndex,
     )
     .send({ from: recipient });
-  return receipt;
+  return assertMined(receipt);
 }
 
 /** Private tornadoETH balance via the contract's utility function. */
@@ -462,7 +487,7 @@ export async function balanceOfPrivate(token: TornadoEthTokenContract, owner: Az
 /* -------------------------------------------------------------------------- */
 
 export interface BurnForWithdrawal {
-  receipt: TxReceipt;
+  receipt: MinedTxReceipt;
   nonce: Fr;
   recipientL1: EthAddress;
   amount: bigint;
@@ -499,7 +524,7 @@ export async function burnForL1Withdrawal(
     chainId: BigInt(stack.l1Client.chain.id),
   });
 
-  return { receipt, nonce, recipientL1: recipient, amount, messageLeaf };
+  return { receipt: assertMined(receipt), nonce, recipientL1: recipient, amount, messageLeaf };
 }
 
 export interface BurnWitness {

@@ -9,7 +9,7 @@ import {IOutbox} from "@aztec/core/interfaces/messagebridge/IOutbox.sol";
  * bridge needs. Importing the real interfaces drags the full rollup library graph
  * (FeeLib/BlobLib/...) into the compilation unit, which a portal has no business compiling.
  * Function selectors and return ABIs match `IRegistry.getCanonicalRollup` and
- * `IRollup.{getInbox,getOutbox,getVersion}` at v5.0.0-nightly.20260601.
+ * `IRollup.{getInbox,getOutbox,getVersion}` at v6.0.0.
  */
 interface IRollupLookup {
   function getInbox() external view returns (IInbox);

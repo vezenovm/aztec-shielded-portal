@@ -12,14 +12,13 @@
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
-import { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
-import { EthAddress } from '@aztec/foundation/eth-address';
-import { TxHash } from '@aztec/stdlib/tx';
+import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { Fr } from '@aztec-labs/aztec.js/fields';
+import { EthAddress } from '@aztec-labs/foundation/eth-address';
+import { TxHash } from '@aztec-labs/stdlib/tx';
 
 import {
   ONE_ETH,
-  TornadoEthTokenContract,
   balanceOfPrivate,
   burnForL1Withdrawal,
   claimTornadoEth,
@@ -29,6 +28,8 @@ import {
   getBurnWitness,
   getTotalLockedEth,
   makeL1Client,
+  assertMined,
+  loadTornadoEthToken,
   makeMessageConsumable,
   setupBridgeStack,
   withdrawFromMockRealPool,
@@ -139,7 +140,7 @@ function requireFlag(flags: Record<string, string | boolean>, name: string): str
 async function loadStack(state: PortalState) {
   const l1Client = makeL1Client();
   const conn = await connectToAztec();
-  const token = await TornadoEthTokenContract.at(AztecAddress.fromString(state.token), conn.wallet);
+  const token = await loadTornadoEthToken(conn, AztecAddress.fromStringUnsafe(state.token));
   return {
     l1Client,
     node: conn.node,
@@ -154,9 +155,18 @@ async function loadStack(state: PortalState) {
   };
 }
 
-function pickAccount(accounts: AztecAddress[], flag: string | boolean | undefined): AztecAddress {
+/** Parse a user-supplied Aztec address, rejecting values that are not on the Grumpkin curve. */
+async function parseAztecAddress(value: string): Promise<AztecAddress> {
+  const address = AztecAddress.fromStringUnsafe(value);
+  if (!(await address.isValid())) {
+    throw new Error(`Invalid Aztec address: ${value}`);
+  }
+  return address;
+}
+
+async function pickAccount(accounts: AztecAddress[], flag: string | boolean | undefined): Promise<AztecAddress> {
   if (typeof flag === 'string') {
-    return /^0x/.test(flag) ? AztecAddress.fromString(flag) : accounts[Number(flag)];
+    return /^0x/.test(flag) ? parseAztecAddress(flag) : accounts[Number(flag)];
   }
   return accounts[0];
 }
@@ -190,7 +200,7 @@ function cmdGenerateSecret(): void {
 }
 
 async function cmdGenerateCommitment(flags: Record<string, string | boolean>): Promise<void> {
-  const recipient = AztecAddress.fromString(requireFlag(flags, 'recipient'));
+  const recipient = await parseAztecAddress(requireFlag(flags, 'recipient'));
   const secret = Fr.fromHexString(requireFlag(flags, 'secret'));
   const amount = BigInt((flags.amount as string) ?? ONE_ETH.toString());
   console.log((await computeAztecMintCommitment(recipient, secret, amount)).toString());
@@ -199,7 +209,7 @@ async function cmdGenerateCommitment(flags: Record<string, string | boolean>): P
 async function cmdWithdrawToPortal(flags: Record<string, string | boolean>): Promise<void> {
   const state = loadState();
   const stack = await loadStack(state);
-  const recipient = pickAccount(stack.accounts, flags.recipient);
+  const recipient = await pickAccount(stack.accounts, flags.recipient);
 
   const deposit =
     state.mode === 'real'
@@ -215,7 +225,7 @@ async function cmdWithdrawToPortal(flags: Record<string, string | boolean>): Pro
 async function cmdClaim(flags: Record<string, string | boolean>): Promise<void> {
   const state = loadState();
   const stack = await loadStack(state);
-  const recipient = pickAccount(stack.accounts, flags.recipient);
+  const recipient = await pickAccount(stack.accounts, flags.recipient);
   const index = flags.deposit !== undefined ? Number(flags.deposit) : state.deposits.length - 1;
   const stored = state.deposits[index];
   if (!stored) throw new Error('No deposit to claim (run withdraw-to-portal first).');
@@ -229,8 +239,8 @@ async function cmdClaim(flags: Record<string, string | boolean>): Promise<void> 
 async function cmdTransfer(flags: Record<string, string | boolean>): Promise<void> {
   const state = loadState();
   const stack = await loadStack(state);
-  const from = pickAccount(stack.accounts, flags.from);
-  const to = AztecAddress.fromString(requireFlag(flags, 'to'));
+  const from = await pickAccount(stack.accounts, flags.from);
+  const to = await parseAztecAddress(requireFlag(flags, 'to'));
   const amount = BigInt(requireFlag(flags, 'amount'));
   await stack.token.methods.transfer_private(to, amount).send({ from });
   console.log(`Transferred ${amount} wei. balance(from)=${await balanceOfPrivate(stack.token, from)}`);
@@ -239,7 +249,7 @@ async function cmdTransfer(flags: Record<string, string | boolean>): Promise<voi
 async function cmdBurn(flags: Record<string, string | boolean>): Promise<void> {
   const state = loadState();
   const stack = await loadStack(state);
-  const from = pickAccount(stack.accounts, flags.from);
+  const from = await pickAccount(stack.accounts, flags.from);
   const recipientL1 = requireFlag(flags, 'recipient-l1') as `0x${string}`;
   const amount = BigInt(requireFlag(flags, 'amount'));
 
@@ -264,13 +274,13 @@ async function cmdBurn(flags: Record<string, string | boolean>): Promise<void> {
 async function cmdRedeem(flags: Record<string, string | boolean>): Promise<void> {
   const state = loadState();
   const stack = await loadStack(state);
-  const blockProducer = pickAccount(stack.accounts, flags['block-producer']);
+  const blockProducer = await pickAccount(stack.accounts, flags['block-producer']);
   const index = flags.burn !== undefined ? Number(flags.burn) : state.burns.length - 1;
   const stored = state.burns[index];
   if (!stored) throw new Error('No burn to redeem (run burn first).');
 
   // Re-fetch the burn tx receipt so getBurnWitness can locate the settled L2->L1 message.
-  const receipt = await stack.node.getTxReceipt(TxHash.fromString(stored.txHash));
+  const receipt = assertMined(await stack.node.getTxReceipt(TxHash.fromString(stored.txHash)));
   const burn: BurnForWithdrawal = {
     receipt,
     nonce: Fr.fromHexString(stored.nonce),

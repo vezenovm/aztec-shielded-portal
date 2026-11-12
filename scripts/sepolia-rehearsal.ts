@@ -12,9 +12,9 @@
  *   - Sepolia: L1_RPC_URL, L1_CHAIN_ID=11155111, L1_PRIVATE_KEY (funded).
  *   - Aztec testnet: AZTEC_NODE_URL, plus a funded account (faucet / fee juice / sponsored FPC).
  */
-import { AztecAddress } from '@aztec/aztec.js/addresses';
-import { createAztecNodeClient } from '@aztec/aztec.js/node';
-import { EmbeddedWallet } from '@aztec/wallets/embedded';
+import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { createAztecNodeClient } from '@aztec-labs/aztec.js/node';
+import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
 import { parseAbi } from 'viem';
 
 import {

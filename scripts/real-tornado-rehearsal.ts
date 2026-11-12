@@ -14,7 +14,7 @@
  *
  * PREREQUISITES (none are bundled here; running this is the operator's consented step -- see
  * SECURITY.md):
- *   1. A mainnet fork: `anvil --fork-url $MAINNET_RPC_URL` -- then set L1_RPC_URL to it.
+ *   1. A mainnet fork: `aztec-anvil --fork-url $MAINNET_RPC_URL` -- then set L1_RPC_URL to it.
  *   2. A tornado-cli checkout with deps installed, and TORNADO_CLI_DIR pointing at it:
  *        git clone https://github.com/tornadocash/tornado-cli && cd tornado-cli && npm install
  *      (tornado-cli ships the circom1/websnark toolchain + the ETHTornado artifact we deploy from.)
@@ -23,10 +23,9 @@
  * packing assumptions vs our pinned tornado-cli commit -- re-pin tornado-cli, or compare against its
  * own `withdraw` command output.
  */
-import { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
-import { deployL1Contract } from '@aztec/ethereum/deploy-l1-contract';
-import { EthAddress } from '@aztec/foundation/eth-address';
+import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { deployL1Contract } from '@aztec-labs/ethereum/deploy-l1-contract';
+import { EthAddress } from '@aztec-labs/foundation/eth-address';
 import { type Abi, parseAbi } from 'viem';
 
 import MockInboxJson from '../contracts/l1/out/MessagingMocks.sol/MockInbox.json' with { type: 'json' };
@@ -81,7 +80,7 @@ export async function runRealTornadoRehearsal(
 ): Promise<RehearsalResult> {
   const cliDir = opts.cliDir ?? requireEnv('TORNADO_CLI_DIR', 'a tornado-cli checkout with deps installed');
   const client = makeL1Client({
-    rpcUrl: opts.rpcUrl ?? requireEnv('L1_RPC_URL', 'a mainnet fork endpoint, e.g. anvil --fork-url'),
+    rpcUrl: opts.rpcUrl ?? requireEnv('L1_RPC_URL', 'a mainnet fork endpoint, e.g. aztec-anvil --fork-url'),
     chainId: opts.chainId ?? Number(process.env.L1_CHAIN_ID ?? 1),
     mnemonic: process.env.L1_MNEMONIC ?? TEST_MNEMONIC,
   });
@@ -113,13 +112,13 @@ export async function runRealTornadoRehearsal(
   const rollup = await deployMock(client, MockRollupJson, [inbox, outbox, 1n]);
   const registry = await deployMock(client, MockRegistryJson, [rollup]);
   const bridge = await deployTornadoBridge(client);
-  await initializeBridge(client, bridge, EthAddress.fromString(registry), AztecAddress.fromField(new Fr(0x1234n)));
+  await initializeBridge(client, bridge, EthAddress.fromString(registry), await AztecAddress.random());
   const factory = await deployForwarderFactory(client, bridge, ownTornado);
   await setForwarderFactory(client, bridge, factory);
 
   // 4. Real proof bound to the forwarder -> factory -> portal. Our pool's only leaf is ours.
   console.log('Generating the real proof and bridging...');
-  const recipient = AztecAddress.fromField(new Fr(0xabcdefn));
+  const recipient = await AztecAddress.random();
   const deposit = await withdrawFromRealTornadoToBridge(
     { l1Client: client, bridge, denomination: ONE_ETH, factory },
     recipient,

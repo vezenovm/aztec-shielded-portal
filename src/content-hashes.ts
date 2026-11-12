@@ -4,11 +4,11 @@
  * (`content_hashes.nr`). Used by tests/scripts to predict deposit ids, message
  * contents and outbox leaves.
  */
-import type { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
-import { sha256ToField } from '@aztec/foundation/crypto/sha256';
-import type { EthAddress } from '@aztec/foundation/eth-address';
-import { computeL2ToL1MessageHash } from '@aztec/stdlib/hash';
+import type { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { Fr } from '@aztec-labs/aztec.js/fields';
+import { sha256ToField } from '@aztec-labs/foundation/crypto/sha256';
+import type { EthAddress } from '@aztec-labs/foundation/eth-address';
+import { computeL2ToL1MessageHash } from '@aztec-labs/stdlib/hash';
 import { encodeAbiParameters, parseAbiParameters, toFunctionSelector } from 'viem';
 
 const CLAIM_SIGNATURE = 'claim_from_tornado_bridge(bytes32,uint256)';

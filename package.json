@@ -11,11 +11,11 @@
   "scripts": {
     "compile:aztec": "cd contracts/aztec && aztec compile",
     "codegen": "aztec codegen contracts/aztec/target -o src/generated",
-    "build:l1": "forge build --root contracts/l1",
+    "build:l1": "aztec-forge build --root contracts/l1",
     "build": "yarn compile:aztec && yarn codegen && yarn build:l1 && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test:l1": "forge test --root contracts/l1",
-    "test:l1:fork": "forge test --root contracts/l1 --match-path 'test/fork/*.t.sol' -vv",
+    "test:l1": "aztec-forge test --root contracts/l1",
+    "test:l1:fork": "aztec-forge test --root contracts/l1 --match-path 'test/fork/*.t.sol' -vv",
     "test:sdk": "node --import tsx --test test/sdk-config.test.ts test/real-tornado.test.ts",
     "test:aztec-unit": "cd contracts/aztec && aztec test",
     "test:aztec": "node --import tsx --test test/aztec.test.ts",
@@ -30,15 +30,15 @@
     "clean": "rm -rf contracts/aztec/target contracts/l1/out contracts/l1/cache src/generated .tsbuildinfo"
   },
   "dependencies": {
-    "@aztec/accounts": "5.0.0-rc.1",
-    "@aztec/aztec.js": "5.0.0-rc.1",
-    "@aztec/constants": "5.0.0-rc.1",
-    "@aztec/ethereum": "5.0.0-rc.1",
-    "@aztec/foundation": "5.0.0-rc.1",
-    "@aztec/l1-artifacts": "5.0.0-rc.1",
-    "@aztec/stdlib": "5.0.0-rc.1",
-    "@aztec/wallets": "5.0.0-rc.1",
-    "viem": "npm:@aztec/viem@2.38.2"
+    "@aztec-foundation/l1-artifacts": "6.0.0",
+    "@aztec-labs/accounts": "6.0.0",
+    "@aztec-labs/aztec.js": "6.0.0",
+    "@aztec-labs/constants": "6.0.0",
+    "@aztec-labs/ethereum": "6.0.0",
+    "@aztec-labs/foundation": "6.0.0",
+    "@aztec-labs/stdlib": "6.0.0",
+    "@aztec-labs/wallets": "6.0.0",
+    "viem": "2.57.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
