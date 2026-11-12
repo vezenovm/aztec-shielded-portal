@@ -32,9 +32,11 @@ import {
   makeL1Client,
   makeMessageConsumable,
   ONE_ETH,
+  PXE_SYNC_CHAIN_TIP,
   setForwarderFactory,
   withdrawFromRealTornadoToBridge,
   withdrawFromAztecOnL1,
+  waitForL1Success,
 } from '../src/index.js';
 
 const tornadoDepositAbi = parseAbi(['function deposit(bytes32 _commitment) external payable']);
@@ -57,7 +59,7 @@ async function registerTestnetAccount(_wallet: AztecConnection['wallet']): Promi
 /** Aztec testnet connection: real proving enabled, one funded account. */
 async function connectToAztecTestnet(nodeUrl: string): Promise<AztecConnection> {
   const node = createAztecNodeClient(nodeUrl);
-  const wallet = await EmbeddedWallet.create(nodeUrl, { pxeConfig: { proverEnabled: true } });
+  const wallet = await EmbeddedWallet.create(nodeUrl, { pxeConfig: { proverEnabled: true, syncChainTip: PXE_SYNC_CHAIN_TIP } });
   const account = await registerTestnetAccount(wallet);
   return { node, wallet, accounts: [account] };
 }
@@ -107,7 +109,7 @@ export async function runSepoliaRehearsal(): Promise<{ lockedEthAfter: bigint }>
     account: l1Client.account!,
     chain: l1Client.chain,
   });
-  await l1Client.waitForTransactionReceipt({ hash: depositHash });
+  await waitForL1Success(l1Client, depositHash);
 
   // 4. Real proof -> forwarder -> portal. For a freshly deployed pool our deposit is the only leaf;
   // for a pool with prior deposits, reconstruct the full ordered commitment set (see docs/TESTNET.md).

@@ -24,7 +24,7 @@ import { computeL2ToL1MembershipWitness } from '@aztec-labs/stdlib/messaging';
 import type { MinedTxReceipt, TxReceipt } from '@aztec-labs/stdlib/tx';
 import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
 import { registerInitialLocalNetworkAccountsInWallet } from '@aztec-labs/wallets/testing';
-import { defineChain, parseAbi, parseEventLogs, type Abi, type Chain } from 'viem';
+import { defineChain, parseAbi, parseEventLogs, type Abi, type Chain, type TransactionReceipt } from 'viem';
 import { foundry } from 'viem/chains';
 
 import { computeAztecMintCommitment, generateMintSecret } from './commitment.js';
@@ -47,6 +47,21 @@ export const DEFAULT_L1_CHAIN_ID = foundry.id;
 export const L1_RPC_URL = process.env.L1_RPC_URL ?? DEFAULT_L1_RPC_URL;
 export const L1_CHAIN_ID = Number(process.env.L1_CHAIN_ID ?? DEFAULT_L1_CHAIN_ID);
 export const AZTEC_NODE_URL = process.env.AZTEC_NODE_URL ?? 'http://localhost:8080';
+
+const SYNC_CHAIN_TIPS = ['proposed', 'checkpointed', 'proven', 'finalized'] as const;
+type SyncChainTip = (typeof SYNC_CHAIN_TIPS)[number];
+
+/**
+ * The chain tip the wallet's PXE anchors transactions to. L1->L2 readiness is checked at the same
+ * tip, so a message "ready" at a newer tip can't pass the check yet fail the claim's membership proof.
+ */
+export const PXE_SYNC_CHAIN_TIP: SyncChainTip = (() => {
+  const tip = process.env.PXE_SYNC_CHAIN_TIP ?? 'proposed';
+  if (!(SYNC_CHAIN_TIPS as readonly string[]).includes(tip)) {
+    throw new Error(`PXE_SYNC_CHAIN_TIP must be one of ${SYNC_CHAIN_TIPS.join(', ')} (got ${tip})`);
+  }
+  return tip as SyncChainTip;
+})();
 /** Anvil's well-known dev mnemonic; HD account 0 deploys and owns the L1 contracts. */
 export const TEST_MNEMONIC = 'test test test test test test test test test test test junk';
 
@@ -183,13 +198,29 @@ export async function connectToAztec(nodeUrl = AZTEC_NODE_URL): Promise<AztecCon
   const node = createAztecNodeClient(nodeUrl);
   const wallet = await EmbeddedWallet.create(nodeUrl, {
     ephemeral: true,
-    pxeConfig: { proverEnabled: false },
+    pxeConfig: { proverEnabled: false, syncChainTip: PXE_SYNC_CHAIN_TIP },
   });
   const accounts = await registerInitialLocalNetworkAccountsInWallet(wallet);
   if (accounts.length < 2) {
     throw new Error('Expected prefunded local-network accounts — is `aztec start --local-network` running?');
   }
   return { node, wallet, accounts };
+}
+
+/**
+ * Wait for an L1 tx and require it succeeded. viem resolves `waitForTransactionReceipt` for mined
+ * txs with `status: 'reverted'` too, which would otherwise read as success (e.g. a redemption whose
+ * outbox leaf another executor consumed first, or whose recipient rejects ETH).
+ */
+export async function waitForL1Success(
+  client: Pick<L1Client, 'waitForTransactionReceipt'>,
+  hash: `0x${string}`,
+): Promise<TransactionReceipt> {
+  const receipt = await client.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') {
+    throw new Error(`L1 tx ${hash} reverted`);
+  }
+  return receipt;
 }
 
 /**
@@ -225,7 +256,7 @@ export async function deployTornadoBridge(client: L1Client): Promise<`0x${string
 /** Fund the mock pool with ETH (stands in for Tornado deposits). */
 export async function fundPool(client: L1Client, pool: `0x${string}`, amount: bigint): Promise<void> {
   const hash = await client.sendTransaction({ to: pool, value: amount, account: client.account!, chain: client.chain });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 export async function approvePool(
@@ -242,7 +273,7 @@ export async function approvePool(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 export async function deployTornadoEthToken(
@@ -271,7 +302,7 @@ export async function initializeBridge(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 export interface BridgeStack {
@@ -385,7 +416,7 @@ export async function withdrawFromTornadoToBridge(
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
   });
-  const receipt = await stack.l1Client.waitForTransactionReceipt({ hash });
+  const receipt = await waitForL1Success(stack.l1Client, hash);
 
   const [log] = parseEventLogs({
     abi: TornadoEthBridgeL1Abi,
@@ -438,7 +469,7 @@ export async function makeMessageConsumable(
 ): Promise<void> {
   await retryUntil(
     async () => {
-      if (await isL1ToL2MessageReady(stack.node, deposit.messageHash)) {
+      if (await isL1ToL2MessageReady(stack.node, deposit.messageHash, PXE_SYNC_CHAIN_TIP)) {
         return true;
       }
       await advanceL2Blocks(stack.token, account, 1);
@@ -589,7 +620,7 @@ export async function withdrawFromAztecOnL1(
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
   });
-  await stack.l1Client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(stack.l1Client, hash);
 }
 
 /** Bridge reserve accounting, as tracked on L1. */
@@ -673,7 +704,7 @@ export async function setForwarderFactory(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 async function setMockRealPoolKnownRoot(
@@ -689,7 +720,7 @@ async function setMockRealPoolKnownRoot(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 /**
@@ -709,7 +740,7 @@ export async function withdrawViaForwarder(
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
   });
-  const receipt = await stack.l1Client.waitForTransactionReceipt({ hash });
+  const receipt = await waitForL1Success(stack.l1Client, hash);
 
   const [log] = parseEventLogs({
     abi: TornadoEthBridgeL1Abi,

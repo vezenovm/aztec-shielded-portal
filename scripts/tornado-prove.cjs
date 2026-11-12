@@ -6,8 +6,9 @@
  * A faithful PORT of tornado-cli's proving path (`createDeposit` / `parseNote` / `generateProof`).
  * It is invoked by `proveViaTornadoCli` / `createTornadoNoteViaCli` in `src/real-tornado.ts` as a
  * child process with `cwd = $TORNADO_CLI_DIR`, so that:
- *   - `require('snarkjs' | 'circomlib' | 'fixed-merkle-tree' | 'websnark/...')` resolve against the
- *     tornado-cli clone's node_modules (the canonical circom1 + websnark forks), and
+ *   - `snarkjs` / `circomlib` / `fixed-merkle-tree` / `websnark/...` resolve against the tornado-cli
+ *     clone's node_modules (the canonical circom1 + websnark forks) via a `createRequire` rooted at
+ *     cwd -- a bare `require` would resolve relative to THIS file, not the checkout -- and
  *   - the circuit artifacts load from `<cwd>/build/circuits/{tornado.json,tornadoProvingKey.bin}`.
  *
  * Why delegate instead of using snarkjs/circom2: the classic mainnet verifier only accepts proofs
@@ -19,10 +20,11 @@
  * README "Real Tornado" section. The proof packing is validated end-to-end only by the env-gated
  * fork rehearsal (`scripts/real-tornado-rehearsal.ts`), never by the offline suite.
  *
- * Usage (argv[2] = subcommand, argv[3] = JSON payload):
- *   node tornado-prove.cjs create-note '{"currency":"eth","amount":"1","netId":1}'
+ * Usage (argv[2] = subcommand, JSON payload on STDIN -- never argv, since the payload carries the
+ * spendable note and argv is visible to other processes and echoed in spawn errors):
+ *   echo '{"currency":"eth","amount":"1","netId":1}' | node tornado-prove.cjs create-note
  *     -> {"note":"tornado-eth-1-1-0x..","commitment":"0x..","nullifierHash":"0x.."}
- *   node tornado-prove.cjs prove '{"note":"tornado-eth-1-1-0x..","recipient":"0x..","leaves":["123.."]}'
+ *   echo '{"note":"tornado-eth-1-1-0x..","recipient":"0x..","leaves":["123.."]}' | node tornado-prove.cjs prove
  *     -> {"proof":"0x..","root":"0x..","nullifierHash":"0x..","args":["0x.."]}
  *
  * `leaves` is the ordered list of pool commitments (decimal or hex) INCLUDING ours; for a freshly
@@ -31,11 +33,15 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const snarkjs = require('snarkjs');
-const circomlib = require('circomlib');
-const merkleTree = require('fixed-merkle-tree');
-const buildGroth16 = require('websnark/src/groth16');
-const websnarkUtils = require('websnark/src/utils');
+const { createRequire } = require('module');
+
+// Resolve tornado-cli's dependencies from its checkout (cwd), not from this repo.
+const cliRequire = createRequire(path.join(process.cwd(), 'package.json'));
+const snarkjs = cliRequire('snarkjs');
+const circomlib = cliRequire('circomlib');
+const merkleTree = cliRequire('fixed-merkle-tree');
+const buildGroth16 = cliRequire('websnark/src/groth16');
+const websnarkUtils = cliRequire('websnark/src/utils');
 
 const bigInt = snarkjs.bigInt;
 const MERKLE_TREE_HEIGHT = Number(process.env.MERKLE_TREE_HEIGHT || 20);
@@ -124,7 +130,8 @@ async function prove({ note, recipient, leaves, relayer = 0, fee = 0, refund = 0
 (async () => {
   try {
     const cmd = process.argv[2];
-    const payload = process.argv[3] ? JSON.parse(process.argv[3]) : {};
+    const raw = fs.readFileSync(0, 'utf8');
+    const payload = raw.trim() ? JSON.parse(raw) : {};
     let out;
     if (cmd === 'create-note') out = createNote(payload);
     else if (cmd === 'prove') out = await prove(payload);

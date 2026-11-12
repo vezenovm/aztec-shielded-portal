@@ -114,15 +114,25 @@ export interface TornadoProof {
 
 /**
  * Run `scripts/tornado-prove.cjs` inside `cliDir` ($TORNADO_CLI_DIR) so its requires resolve against
- * tornado-cli's (circom1 + websnark) node_modules and its `build/circuits` artifacts. Throws with the
- * helper's stderr if tornado-cli is missing/uninstalled -- that toolchain is the operator's to set up.
+ * tornado-cli's (circom1 + websnark) node_modules and its `build/circuits` artifacts. The payload
+ * (which carries the spendable note) goes over stdin, never argv. Throws with only the helper's
+ * stderr if tornado-cli is missing/uninstalled -- that toolchain is the operator's to set up.
  */
 function runHelper(cliDir: string, sub: 'create-note' | 'prove', payload: unknown): unknown {
-  const out = execFileSync(process.execPath, [PROVE_HELPER, sub, JSON.stringify(payload)], {
-    cwd: cliDir,
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  let out: string;
+  try {
+    out = execFileSync(process.execPath, [PROVE_HELPER, sub], {
+      cwd: cliDir,
+      input: JSON.stringify(payload),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (err) {
+    // Deliberately drop the spawn error's message/options: rebuild from the helper's stderr only.
+    const stderr = String((err as { stderr?: unknown }).stderr ?? '').trim();
+    throw new Error(`tornado-prove ${sub} failed in ${cliDir}: ${stderr || 'no output'}`);
+  }
   return JSON.parse(out.trim().split('\n').pop() as string);
 }
 

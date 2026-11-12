@@ -111,7 +111,9 @@ Real pools pay via `recipient.call{value}("")`, which can't carry a commitment. 
 bound into the proof's `recipient`: `recipient = CREATE2(ForwarderFactory, salt = aztecMintCommitment)`.
 The per-commitment `Forwarder` deployed there forwards exactly the denomination to the portal, which
 re-derives the address and checks it against `msg.sender`. Changing the commitment changes the
-recipient, which invalidates the proof.
+recipient, which invalidates the proof. If someone replays the proof directly against the pool, the ETH lands at the
+undeployed forwarder; anyone can then call `ForwarderFactory.bridgeSpentWithdrawal` with the same
+proof, which re-verifies it against the pool's verifier and finishes the original mint.
 
 Proving is delegated to a caller-supplied `tornado-cli` (`proveViaTornadoCli`); nothing from Tornado
 is vendored.

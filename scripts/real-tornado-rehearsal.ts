@@ -45,6 +45,7 @@ import {
   TEST_MNEMONIC,
   withdrawFromRealTornadoToBridge,
   type L1Client,
+  waitForL1Success,
 } from '../src/index.js';
 import { createTornadoNoteViaCli, TORNADO_1ETH_MAINNET } from '../src/real-tornado.js';
 
@@ -75,6 +76,24 @@ export interface RehearsalResult {
   depositId: `0x${string}`;
 }
 
+/**
+ * Refuse to run anywhere but an Anvil mainnet fork. The rehearsal deploys contracts and deposits
+ * 1 ETH from the signer (which may come from L1_PRIVATE_KEY/L1_MNEMONIC), so a live endpoint would
+ * spend real funds.
+ */
+async function assertAnvilFork(client: L1Client): Promise<void> {
+  const rpc = client as unknown as { request(args: { method: string }): Promise<unknown> };
+  let info: { forkConfig?: { forkUrl?: string | null } };
+  try {
+    info = (await rpc.request({ method: 'anvil_nodeInfo' })) as typeof info;
+  } catch {
+    throw new Error('L1_RPC_URL is not an Anvil node. The rehearsal only runs on `aztec-anvil --fork-url <mainnet>`.');
+  }
+  if (!info?.forkConfig?.forkUrl) {
+    throw new Error('L1_RPC_URL is Anvil but not a fork. Start it with `aztec-anvil --fork-url <mainnet>`.');
+  }
+}
+
 export async function runRealTornadoRehearsal(
   opts: { rpcUrl?: string; chainId?: number; cliDir?: string; realPool?: `0x${string}` } = {},
 ): Promise<RehearsalResult> {
@@ -84,6 +103,7 @@ export async function runRealTornadoRehearsal(
     chainId: opts.chainId ?? Number(process.env.L1_CHAIN_ID ?? 1),
     mnemonic: process.env.L1_MNEMONIC ?? TEST_MNEMONIC,
   });
+  await assertAnvilFork(client);
 
   // 1. Our own ETHTornado on the fork, pointed at the REAL verifier read from the canonical pool.
   const realPool = opts.realPool ?? TORNADO_1ETH_MAINNET;
@@ -103,7 +123,7 @@ export async function runRealTornadoRehearsal(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash: depositHash });
+  await waitForL1Success(client, depositHash);
 
   // 3. L1-only Aztec messaging stubs + the bridge + a forwarder factory pointed at our pool.
   console.log('Deploying messaging mocks + bridge + forwarder factory...');

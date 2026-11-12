@@ -11,6 +11,12 @@ pragma solidity >=0.8.27;
  * Aztec commitment into the proof-bound `_recipient` (via a per-commitment CREATE2 forwarder)
  * instead of relying on a callback the real pool does not make.
  */
+/// @notice Tornado Classic's Groth16 verifier (`IVerifier` in tornado-core).
+interface ITornadoVerifier {
+  /// @param _input `[root, nullifierHash, recipient, relayer, fee, refund]`, as `Tornado.withdraw` passes it.
+  function verifyProof(bytes memory _proof, uint256[6] memory _input) external returns (bool);
+}
+
 interface ITornadoInstance {
   function denomination() external view returns (uint256);
 

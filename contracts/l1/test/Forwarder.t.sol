@@ -187,6 +187,85 @@ contract ForwarderTest is Test {
     spoof.attack{value: 1 ether}(bridge, NULLIFIER, COMMITMENT);
   }
 
+  /* ------------------------ Front-run recovery ------------------------ */
+
+  /// @dev A front-runner replays the pending proof directly against the pool: the pool pays the
+  /// undeployed forwarder and spends the nullifier, so withdrawAndBridge can no longer succeed.
+  function _frontRunDirectlyToPool(bytes32 _commitment) internal returns (address forwarder) {
+    forwarder = factory.computeForwarderAddress(_commitment);
+    vm.prank(makeAddr("frontRunner"));
+    pool.withdraw("", ROOT, NULLIFIER, payable(forwarder), payable(address(0)), 0, 0);
+  }
+
+  function _validInputs(address _recipient) internal pure returns (uint256[6] memory) {
+    return [uint256(ROOT), uint256(NULLIFIER), uint256(uint160(_recipient)), 0, 0, 0];
+  }
+
+  function test_FrontRunDirectPoolWithdrawalIsRecoverable() public {
+    address forwarder = _frontRunDirectlyToPool(COMMITMENT);
+    assertEq(forwarder.balance, DENOMINATION, "pool paid the undeployed forwarder");
+    assertEq(forwarder.code.length, 0);
+
+    vm.expectRevert(MockRealTornadoPool.NoteAlreadySpent.selector);
+    factory.withdrawAndBridge("", ROOT, NULLIFIER, COMMITMENT);
+
+    // Anyone (here the front-runner) can finish the bridge, but only to the original commitment.
+    vm.expectEmit(true, true, true, true, address(factory));
+    emit ForwarderWithdrawal(forwarder, NULLIFIER, COMMITMENT, DENOMINATION);
+    vm.prank(makeAddr("frontRunner"));
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+
+    assertEq(address(bridge).balance, DENOMINATION, "bridge locked the stranded denomination");
+    assertEq(bridge.totalLockedEth(), DENOMINATION);
+    assertEq(forwarder.balance, 0);
+    assertTrue(bridge.consumedDepositIds(_depositId(forwarder, NULLIFIER, DENOMINATION)));
+    (,,, bytes32 secretHash) = inbox.lastMessage();
+    assertEq(secretHash, COMMITMENT, "mint goes to the original commitment");
+  }
+
+  function test_RevertWhen_RecoveryForUnspentNullifier() public {
+    vm.expectRevert(abi.encodeWithSelector(ForwarderFactory.WithdrawalNotSpent.selector, NULLIFIER));
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+  }
+
+  function test_RevertWhen_RecoveryProofBoundToAnotherRecipient() public {
+    // Only the proof for recipient = forwarder(COMMITMENT) is valid.
+    pool.setProofValid(false);
+    pool.mockVerifier().setValidInputs(_validInputs(factory.computeForwarderAddress(COMMITMENT)), true);
+    _frontRunDirectlyToPool(COMMITMENT);
+
+    // Re-pointing the spent withdrawal at another commitment fails proof verification, even if that
+    // commitment's forwarder address holds ETH.
+    bytes32 otherCommitment = bytes32(uint256(0xbad));
+    vm.deal(factory.computeForwarderAddress(otherCommitment), DENOMINATION);
+    vm.expectRevert(ForwarderFactory.InvalidWithdrawProof.selector);
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, otherCommitment);
+
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+    assertEq(bridge.totalLockedEth(), DENOMINATION);
+  }
+
+  function test_RevertWhen_RecoveryReplayed() public {
+    address forwarder = _frontRunDirectlyToPool(COMMITMENT);
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+
+    // Topping the forwarder up with plain ETH cannot mint a second deposit for the same nullifier.
+    vm.deal(forwarder, DENOMINATION);
+    bytes32 depositId = _depositId(forwarder, NULLIFIER, DENOMINATION);
+    vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.DepositAlreadyRegistered.selector, depositId));
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+  }
+
+  function test_RevertWhen_RecoveryAfterNormalBridge() public {
+    factory.withdrawAndBridge("", ROOT, NULLIFIER, COMMITMENT);
+    address forwarder = factory.computeForwarderAddress(COMMITMENT);
+
+    vm.deal(forwarder, DENOMINATION);
+    bytes32 depositId = _depositId(forwarder, NULLIFIER, DENOMINATION);
+    vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.DepositAlreadyRegistered.selector, depositId));
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+  }
+
   /* ------------------------------ Coexistence ------------------------------ */
 
   function test_FactoryDenominationMatchesPool() public view {
