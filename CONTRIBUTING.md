@@ -4,16 +4,17 @@ This is an unaudited research PoC (see [README](./README.md) and [SECURITY.md](.
 
 ## Ground rules
 
-- Everything pins to **one** Aztec version (currently `5.0.0-rc.1`): the `@aztec/*` npm packages, the
-  `aztec-nr` tags in `contracts/aztec/tornado_eth_token/Nargo.toml`, and the `aztec` CLI. Bump them
-  together.
+- Everything pins to **one** Aztec version (currently `6.0.0`): the `@aztec-labs/*` +
+  `@aztec-foundation/l1-artifacts` npm packages, the `aztec-nr` tags in
+  `contracts/aztec/tornado_eth_token/Nargo.toml`, and the `aztec-up` toolchain (incl. `aztec-forge`).
+  Bump them together.
 - Noir comments must be **ASCII** (em-dashes/Unicode break `aztec compile`).
 - Nothing from Tornado Cash is vendored — the real-proof path uses a caller-supplied `tornado-cli`.
 
 ## Must stay green (offline, no network)
 
 ```bash
-yarn build                                  # noir compile + codegen + forge build + tsc
+yarn build                                  # noir compile + codegen + aztec-forge build + tsc
 yarn test:l1 && yarn test:sdk && yarn test:aztec-unit
 ```
 

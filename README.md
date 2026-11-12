@@ -1,183 +1,97 @@
-# aztec-shielded-portal — Tornado → Aztec bridge PoC
+# aztec-shielded-portal
 
-A proof-of-concept bridge that lets a user withdraw ETH from a Tornado Cash pool into an
-Ethereum L1 bridge contract, then mint a private Aztec note representing **`tornadoETH`** —
-a reserve-backed claim on the ETH locked in the bridge.
+Tornado Cash → Aztec bridge PoC. ETH withdrawn from a Tornado pool is locked in an L1 portal and
+minted on Aztec as private **`tornadoETH`**, 1:1 reserve-backed and redeemable back to L1.
 
-> **This is a PoC. It is not production-ready.**
->
-> - It does **not** implement Tornado zk proofs. Tornado is modeled as an existing
->   external shielded pool via `MockTornadoPool`.
-> - The bridge mints private `tornadoETH` on Aztec, 1:1 backed by ETH locked on L1.
-> - **Tornado-origin provenance is public** — by design, every wei of reserve is
->   attributable to a Tornado pool withdrawal.
-> - **Aztec ownership and transfers are private** — note ownership, balances and
->   transfers of `tornadoETH` are hidden.
+> **Unaudited research PoC.** Tornado provenance is public by design; Aztec ownership, balances and
+> transfers are private. See [SECURITY.md](./SECURITY.md).
 
 ## Flow
 
 ```text
-Tornado note
-  -> withdrawToBridge (MockTornadoPool)            L1, public
-  -> onTornadoWithdrawal (TornadoEthBridgeL1)      L1 locks ETH, registers depositId
-  -> Inbox.sendL2Message                           L1 -> L2 message (commitment in secretHash slot)
-  -> claim_from_tornado_bridge (TornadoEthToken)   Aztec, private mint to hidden recipient
-  -> transfer_private                              Aztec, private
-  -> burn_for_l1_withdrawal                        Aztec, private burn + L2 -> L1 message
-  -> withdrawFromAztec (TornadoEthBridgeL1)        L1 consumes outbox leaf, releases ETH
+Tornado withdrawal -> TornadoEthBridgeL1 (lock ETH)  -> Inbox.sendL2Message      L1, public
+                   -> claim_from_tornado_bridge      (private mint)              Aztec
+                   -> transfer_private                                           Aztec
+                   -> burn_for_l1_withdrawal         (private burn, L2->L1 msg)  Aztec
+                   -> withdrawFromAztec              (consume outbox, release)   L1
 ```
 
-## Privacy model
-
-| Public (L1 / by design)                          | Private (Aztec)                       |
-| ------------------------------------------------ | ------------------------------------- |
-| A Tornado withdrawal occurred, into the bridge   | The recipient of minted `tornadoETH`  |
-| The denomination (1 ETH) and total reserves      | Ownership of `tornadoETH` notes       |
-| L1 redemption recipient + amount                 | Transfers and intermediate balances   |
-| Timing correlation between L1 entry and L2 mint  | The identity of the burner            |
-
-### Mint commitment (how L1 never learns the Aztec recipient)
-
-The user generates a random `mint_secret` and passes a single `bytes32` through the
-Tornado withdrawal calldata:
+**Deposit → mint.** The user picks a random `mint_secret` and passes one `bytes32` through the
+Tornado withdrawal:
 
 ```text
-inner               = poseidon2([aztec_recipient, mint_secret, amount])
-aztecMintCommitment = compute_secret_hash(inner)          # poseidon2 + secret-hash domain
+aztecMintCommitment = compute_secret_hash([poseidon2([aztec_recipient, mint_secret, amount])])
 ```
 
-The bridge forwards the commitment as the L1→L2 message's `secretHash`; the message
-content commits to `(depositId, amount)`. On Aztec, `claim_from_tornado_bridge`
-recomputes `inner` from the **caller's** address — consumption only succeeds for the
-recipient committed to at deposit time, and the message nullifier makes the claim
-single-use. Wrong secret, wrong amount, wrong recipient, or a second claim all fail
-(covered in `test/aztec.test.ts`).
+It rides in the L1→L2 message's `secretHash` slot; the content commits to `(depositId, amount)`.
+`claim_from_tornado_bridge` recomputes the preimage from `msg_sender`, so only the committed
+recipient can claim, and the message nullifier makes it single-use. L1 never sees the recipient.
 
-### Withdrawal (burn → redeem)
+**Burn → redeem.** `burn_for_l1_withdrawal(recipient_l1, amount, nonce)` nullifies the burner's
+notes and emits an L2→L1 message over `(bridge, recipient_l1, amount, nonce)`, without the burner's
+identity. Once the epoch settles, anyone can call `withdrawFromAztec` with the outbox witness; funds
+only go to the committed recipient, and consuming the leaf prevents replay. The bridge has no
+`receive()`: pool withdrawals are the only ETH ingress.
 
-`burn_for_l1_withdrawal(recipient_l1, amount, nonce)` nullifies the caller's notes
-(change is re-issued automatically) and emits an L2→L1 message committing to
-`(bridge, recipient_l1, amount, nonce)` — the burner's identity is not in the message.
-Once the epoch settles into the L1 Outbox, **anyone** may execute
-`withdrawFromAztec(...)` with the merkle witness (the executor only pays gas; funds can
-only go to the committed recipient). Consuming the outbox leaf is the replay protection:
-one burn = exactly one redemption. The bridge has **no `receive()`** — the pool callback
-is the only ETH ingress, which is what makes provenance attributable.
+| Public (L1)                                  | Private (Aztec)                     |
+| -------------------------------------------- | ----------------------------------- |
+| A Tornado withdrawal into the bridge         | Recipient of minted `tornadoETH`    |
+| Denomination and total reserves              | Note ownership and balances         |
+| L1 redemption recipient + amount             | Transfers, identity of the burner   |
+| Timing correlation of L1 entry and L2 mint   |                                     |
 
-## Repo layout
-
-```text
-contracts/
-  l1/                      Foundry project
-    src/MockTornadoPool.sol         mock fixed-denomination pool (no zk proofs)
-    src/TornadoEthBridgeL1.sol      portal: ingress, reserves, egress
-    src/IAztecMinimal.sol           minimal ABI slices of IRegistry/IRollup
-    test/*.t.sol                    spec L1 tests 1-10 + hardening (mocked Inbox/Outbox)
-  aztec/tornado_eth_token/  Aztec contract (Noir)
-    src/main.nr                     claim / transfer_private / burn / balance_of utility
-    src/content_hashes.nr           sha256 content hashes, byte-identical to L1
-    src/test/                       TXE unit tests
-src/                       TS library (commitment + hash mirrors + deploy/flow helpers)
-  generated/                        `aztec codegen` output (rebuilt, not committed)
-test/
-  aztec.test.ts            spec "Aztec tests" 1-9 (needs local network)
-  e2e.test.ts              spec end-to-end steps 1-8 incl. L1 redemption
-scripts/                   deploy-l1 / deploy-aztec / demo-flow
-```
-
-## Toolchain & version pinning
-
-Everything pins to one nightly — **`5.0.0-rc.1`** — across the sandbox CLI,
-`@aztec/*` npm packages, and the `aztec-nr` git tag in `Nargo.toml`. The L1 contracts
-import Aztec core interfaces (`IInbox`, `IOutbox`, `Hash`, `DataStructures`) and
-forge-std straight out of the **`@aztec/l1-artifacts` npm package** (see
-`contracts/l1/foundry.toml` remappings), so the Solidity side is version-locked too.
-
-Prerequisites: Node 22+, Yarn 4 (corepack), Foundry, and
+## Toolchain
 
 ```bash
-aztec-up install 5.0.0-rc.1
-aztec --version   # must print 5.0.0-rc.1
+aztec-up install 6.0.0
 ```
 
 ## Quickstart
 
 ```bash
 corepack enable && yarn install
-yarn build                  # noir compile + codegen + forge build + tsc
+yarn build                    # noir compile + codegen + aztec-forge build + tsc
+yarn test:l1 && yarn test:sdk && yarn test:aztec-unit   # offline
 
-# fast, no network needed:
-yarn test:l1                # 24 Foundry tests (spec L1 tests 1-10 + hardening)
-yarn test:sdk               # SDK config/unit coverage
-yarn test:aztec-unit        # TXE suite
-
-# in a separate terminal:
-aztec start --local-network # anvil :8545 + aztec node :8080
-
-yarn test:aztec             # spec Aztec tests 1-9 (claims, transfers, burns)
-yarn test:e2e               # full 8-step flow incl. L1 redemption
-yarn demo                   # narrated end-to-end demo
-
-# or step by step:
-yarn deploy:l1              # pool + bridge -> config.local.json
-yarn deploy:aztec           # tornadoETH + bridge.initialize
+aztec start --local-network   # separate terminal: anvil :8545 + aztec node :8080
+yarn test:aztec && yarn test:e2e
+yarn demo                     # narrated end-to-end run
 ```
 
-### CLI
+## CLI
 
-`yarn portal <command>` is a thin wrapper over the SDK that persists state to
-`config.local.json`, so you can walk the whole lifecycle by hand:
+`yarn portal <command>` wraps the SDK and persists state to `portal-state.json` (`$PORTAL_STATE`):
 
 ```bash
 yarn portal setup [--real]            # deploy + wire the stack (mock pool, or the forwarder path)
-yarn portal generate-secret           # print a fresh mint secret
+yarn portal generate-secret
 yarn portal generate-commitment --recipient <addr> --secret <s> [--amount <wei>]
-yarn portal withdraw-to-portal [--recipient <idx|addr>]      # pool -> bridge (locks ETH, messages L2)
-yarn portal claim [--deposit <idx>] [--recipient <idx|addr>] # mint private tornadoETH
+yarn portal withdraw-to-portal [--recipient <idx|addr>]
+yarn portal claim [--deposit <idx>] [--recipient <idx|addr>]
 yarn portal transfer --to <addr> --amount <wei> [--from <idx|addr>]
 yarn portal burn --recipient-l1 <0x> --amount <wei> [--from <idx|addr>] [--redeem]
 ```
 
-Note on L2→L1 redemption locally: the local network does no real proving; its
-`EpochTestSettler` pushes each completed epoch's out-hash into the L1 Outbox (epoch =
-2 checkpoints), which is what makes `withdrawFromAztec` consumable without a prover.
+Locally, redemption works without a prover: the local network's `EpochTestSettler` pushes each
+completed epoch's out-hash into the L1 Outbox.
 
 ## Environment
 
-Local defaults target `aztec start --local-network`: Anvil on `http://localhost:8545`
-with chain id `31337`, and the local Aztec node on `http://localhost:8080`.
+Defaults target `aztec start --local-network` (Anvil `http://localhost:8545`, chain id `31337`;
+Aztec node `http://localhost:8080`).
 
 | Variable | Purpose |
 | -------- | ------- |
-| `L1_RPC_URL` | L1 RPC URL; comma-separated URLs are accepted. |
-| `L1_CHAIN_ID` | L1 chain id used for viem transactions and L2→L1 burn-message hashing. |
-| `L1_PRIVATE_KEY` | L1 signer private key; preferred over `L1_MNEMONIC`. |
-| `L1_MNEMONIC` | L1 signer mnemonic. |
-| `AZTEC_NODE_URL` | Aztec node/PXE endpoint. |
+| `L1_RPC_URL` | L1 RPC URL (comma-separated accepted). |
+| `L1_CHAIN_ID` | L1 chain id (viem txs + L2→L1 message hashing). |
+| `L1_PRIVATE_KEY` / `L1_MNEMONIC` | L1 signer. Required off local Anvil. |
+| `AZTEC_NODE_URL` | Aztec node endpoint. |
 
-If the L1 RPC/chain is not local Anvil, set `L1_PRIVATE_KEY` or `L1_MNEMONIC`; the
-well-known Anvil test mnemonic is only used for local chain id `31337` on localhost.
+## SDK
 
-## SDK lifecycle
-
-`scripts/demo-flow.ts` is the canonical runnable example. It deploys a fresh stack,
-then executes the full withdraw→claim→transfer→burn→redeem path with balance output.
-`test/e2e.test.ts` covers the same path with assertions and replay checks.
+`scripts/demo-flow.ts` is the canonical example; `test/e2e.test.ts` asserts the same path.
 
 ```ts
-import {
-  ONE_ETH,
-  balanceOfPrivate,
-  burnForL1Withdrawal,
-  claimTornadoEth,
-  getBurnWitness,
-  getTotalLockedEth,
-  makeMessageConsumable,
-  setupBridgeStack,
-  withdrawFromAztecOnL1,
-  withdrawFromTornadoToBridge,
-} from './src/index.js';
-
 const stack = await setupBridgeStack();
 const [alice, bob] = stack.accounts;
 
@@ -185,111 +99,43 @@ const deposit = await withdrawFromTornadoToBridge(stack, alice);
 await makeMessageConsumable(stack, deposit, alice);
 await claimTornadoEth(stack.token, alice, deposit);
 
-await stack.token.methods.transfer_private(bob, (4n * ONE_ETH) / 10n).send({ from: alice });
+await stack.token.methods.transfer_private(bob, ONE_ETH / 2n).send({ from: alice });
 
-const l1Recipient = '0x3000000000000000000000000000000000000003' as const;
-const burn = await burnForL1Withdrawal(stack, bob, l1Recipient, (25n * ONE_ETH) / 100n);
-const witness = await getBurnWitness(stack, burn, alice);
-await withdrawFromAztecOnL1(stack, burn, witness);
-
-console.log(await balanceOfPrivate(stack.token, alice));
-console.log(await getTotalLockedEth(stack.l1Client, stack.bridge));
+const burn = await burnForL1Withdrawal(stack, bob, '0x3000000000000000000000000000000000000003', ONE_ETH / 4n);
+await withdrawFromAztecOnL1(stack, burn, await getBurnWitness(stack, burn, alice));
 ```
 
-For direct integration, construct an L1 client with `makeL1Client({ rpcUrl, chainId,
-privateKey })`, connect to Aztec with `connectToAztec(AZTEC_NODE_URL)`, deploy or load a
-`TornadoEthTokenContract`, and pass the resulting client/token objects into the same
-helpers. Commitment helpers (`generateMintSecret`, `computeAztecMintCommitment`) are
-also exported for callers that need to split commitment generation from the L1 pool
-withdrawal.
+## Real Tornado (Classic)
 
-## Real Tornado (Classic) integration
+Real pools pay via `recipient.call{value}("")`, which can't carry a commitment. So the commitment is
+bound into the proof's `recipient`: `recipient = CREATE2(ForwarderFactory, salt = aztecMintCommitment)`.
+The per-commitment `Forwarder` deployed there forwards exactly the denomination to the portal, which
+re-derives the address and checks it against `msg.sender`. Changing the commitment changes the
+recipient, which invalidates the proof.
 
-The default pool is a mock. The repo also ships an adapter for **real Tornado Cash Classic** (the
-fixed-denomination pools, e.g. the 1 ETH pool `0x47CE…2936`). Real Tornado pays the recipient via a
-plain `recipient.call{value}("")` with no calldata, so it can't carry an Aztec commitment.
+Proving is delegated to a caller-supplied `tornado-cli` (`proveViaTornadoCli`); nothing from Tornado
+is vendored.
 
-**Binding (Option B — CREATE2 forwarder).** The commitment is welded into the proof-bound
-`recipient`: `recipient = CREATE2(factory, salt = aztecMintCommitment)`. A per-commitment `Forwarder`
-is deployed there, receives exactly the denomination, and calls the portal — which re-derives that
-address and matches it against `msg.sender`. Swapping the commitment changes `recipient`, which
-invalidates the Tornado proof. The portal keeps a **dual-path** ingress: the existing approved-pool
-path (mock + all current tests stay green) *and* the approved-forwarder-factory path.
+| Tier | What | Runs |
+| ---- | ---- | ---- |
+| 1 | forwarder vs a real-mimicking mock pool | `yarn test:l1` |
+| 2 | mainnet fork vs real pool bytecode, verifier mocked | `yarn test:l1:fork` |
+| 3 | own `ETHTornado` on a fork vs the **real verifier** | `yarn rehearsal:real-tornado` (operator) |
+| 4 | Sepolia + Aztec testnet | [docs/TESTNET.md](./docs/TESTNET.md) |
 
-**Proving is delegated, not vendored.** Tornado Classic's mainnet verifier only accepts
-circom1/websnark proofs from its exact trusted setup, so `proveViaTornadoCli` (`src/real-tornado.ts`)
-shells out to a **caller-supplied** `tornado-cli` checkout via `scripts/tornado-prove.cjs`. Nothing
-from Tornado Cash is committed to this repo.
-
-| Tier | What | Proves | Runs |
-| ---- | ---- | ------ | ---- |
-| 1 | forwarder unit tests vs a real-mimicking mock pool | handoff, reentrancy, binding | `yarn test:l1` (offline) |
-| 2 | mainnet-fork vs the real pool bytecode, verifier mocked | whole surface except proof validity | forge fork test (gated) |
-| 3 | our own `ETHTornado` on a fork vs the **real verifier** | the real verifier accepts our proof packing | `yarn test:fork` (operator) |
-| 4 | Sepolia tornado-core + Aztec testnet | live, end-to-end | Phase 4 (scaffolded) |
-
-**Running Tier 3** (operator-only — see [SECURITY.md](./SECURITY.md)):
+Tier 3 (operator-only, see [SECURITY.md](./SECURITY.md)):
 
 ```bash
 git clone https://github.com/tornadocash/tornado-cli && (cd tornado-cli && npm install)
-anvil --fork-url "$MAINNET_RPC_URL"        # in a separate terminal
+aztec-anvil --fork-url "$MAINNET_RPC_URL"
 TORNADO_CLI_DIR=/abs/path/to/tornado-cli L1_RPC_URL=http://localhost:8545 yarn rehearsal:real-tornado
 ```
 
-This deploys our own `ETHTornado` on the fork pointed at the real on-chain verifier, deposits a leaf
-we own, generates a real proof bound to the forwarder, and asserts the bridge locked the denomination
-— no real funds, no mainnet leaf history needed.
+## Security properties
 
-## Deviations from the spec
+- ETH leaves L1 only by consuming a valid, unreplayed L2→L1 burn message.
+- `tornadoETH` mints only by consuming a valid L1→L2 deposit message, once.
+- The Aztec recipient never appears on L1.
+- CEI + reentrancy guard on `withdrawFromAztec`; reserves can't go negative; no plain ETH ingress.
 
-Protocol reality required a few interface adjustments; the substance is unchanged:
-
-1. `claim_from_tornado_bridge` gains a `message_leaf_index: Field` parameter — consuming
-   an L1→L2 message requires its inbox leaf index (returned by `sendL2Message`, surfaced
-   in the `TornadoBridgeDeposit` event).
-2. `withdrawFromAztec` takes the real outbox witness `(nonce, epoch,
-   numCheckpointsInEpoch, leafIndex, path)` instead of a bare `burnMessageHash`; the
-   message (and its hash, emitted in `AztecRedemption`) is reconstructed in-contract.
-3. `depositId` uses `Hash.sha256ToField` rather than raw `keccak256` so the id fits in a
-   Noir field and can be recomputed identically inside the claim circuit.
-4. `aztecMintCommitment = compute_secret_hash(poseidon2([recipient, mint_secret,
-   amount]))` rides in the message's `secretHash` slot (the protocol's native private-
-   consumption mechanism); the content carries `(depositId, amount)`. The message leaf
-   commits to all of it.
-5. The spec's L1 unit tests live in Foundry (`contracts/l1/test`), not `l1.test.ts`.
-   Aztec claim-path cases live in `test/aztec.test.ts` against the local network — the
-   TXE cannot inject L1→L2 messages at this version.
-6. `TornadoBridgeDeposit` additionally emits `(messageKey, messageLeafIndex)` so clients
-   don't need to recompute them.
-
-## Adding another bridge (e.g. privacyPoolsETH)
-
-Per-origin assets stay isolated so provenance is obvious. The recipe:
-
-1. **L1**: new portal contract with its own ingress (e.g. verify a Privacy Pools
-   withdrawal instead of `onTornadoWithdrawal`). The generic seams to lift from
-   `TornadoEthBridgeL1` are `_registerDeposit`, `_sendMintMessage`, and
-   `withdrawFromAztec` — they contain nothing Tornado-specific.
-2. **L2**: deploy a second instance of the same token contract shape paired with the new
-   portal (`TornadoEthToken` is origin-agnostic apart from naming) — that instance *is*
-   `privacyPoolsETH`.
-3. Extract a shared abstract base / generic token only when the second bridge actually
-   exists; the PoC deliberately ships concrete contracts.
-
-Do **not** merge origins into one asset; a future unified `shieldedETH` would be a
-separate design with hidden origin metadata.
-
-## Security notes (as implemented)
-
-- ETH leaves L1 only by consuming a valid L2→L1 burn message (`Outbox.consume` reverts
-  on invalid or replayed leaves) — `test_ValidBurnMessageReleasesEth`,
-  `test_RevertWhen_BurnMessageReplayed`.
-- `tornadoETH` mints only by consuming a valid L1→L2 deposit message (message nullifier
-  prevents re-claims) — `rejects claiming the same deposit twice`.
-- One deposit = one claim (`consumedDepositIds` + message nullifier); one burn = one
-  redemption (outbox leaf consumption).
-- The Aztec recipient never appears on L1 (commitment scheme above).
-- Checks-effects-interactions + a reentrancy guard on `withdrawFromAztec`
-  (`test_ReentrantWithdrawalIsBlocked`), and reserves can never go negative
-  (`test_RevertWhen_WithdrawExceedsLockedReserve`).
-- No plain ETH ingress (`test_BridgeHasNoPlainEthIngress`).
+Spec deviations and how to add another origin bridge: [docs/DESIGN.md](./docs/DESIGN.md).

@@ -9,7 +9,7 @@ mainnet or use it with real funds. It targets local networks and testnet only.
   `ForwarderFactory`, `TornadoEthToken`) or the off-chain SDK.
 - **Testnet-only.** Mainnet is explicitly gated on external audit + legal/OFAC sign-off + a
   fee/relayer redesign (see below).
-- Pinned to a single Aztec release (`5.0.0-rc.1`) across the npm packages, the `aztec-nr` tag, and
+- Pinned to a single Aztec release (`6.0.0`) across the npm packages, the `aztec-nr` tag, and
   the `aztec` toolchain.
 
 ## Known limitations & privacy caveats

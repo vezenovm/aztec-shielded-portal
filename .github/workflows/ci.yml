@@ -2,8 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "mv/**"]
-  pull_request:
+    branches: [main]
 
 jobs:
   build-and-test:
@@ -17,15 +16,13 @@ jobs:
           node-version: 22
       - run: corepack enable
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-
-      - name: Install the Aztec toolchain (5.0.0-rc.1)
+      - name: Install the Aztec toolchain (6.0.0, includes aztec-forge)
         run: |
           curl -fsSL https://install.aztec.network | bash
           echo "$HOME/.aztec/bin" >> "$GITHUB_PATH"
-      - name: Pin aztec 5.0.0-rc.1
-        run: aztec-up install 5.0.0-rc.1
+          echo "$HOME/.aztec/current/bin" >> "$GITHUB_PATH"
+      - name: Pin aztec 6.0.0
+        run: aztec-up install 6.0.0
 
       - name: Install JS dependencies
         run: yarn install --immutable
