@@ -1,8 +1,9 @@
 > [!WARNING]
-> **This code has not been audited.** It is experimental research software, provided "as is",
-> without warranty of any kind (see [LICENSE](./LICENSE)). A bug in the L1 portal, the forwarder or
-> the Aztec contract can mint unbacked `tornadoETH` or lock or release ETH incorrectly. Do not use
-> it with real funds without your own independent review. See [SECURITY.md](./SECURITY.md).
+> **AI-generated educational code, not audited.** Written with Claude Code and Codex under human
+> review, for learning and research rather than production use. It is provided "as is", without
+> warranty of any kind (see [LICENSE](./LICENSE)). A bug in the L1 portal, the forwarder or the
+> Aztec contract can mint unbacked `tornadoETH` or lock or release ETH incorrectly. Do not use it
+> with real funds without your own independent review. See [SECURITY.md](./SECURITY.md).
 
 # aztec-shielded-portal
 
@@ -46,7 +47,12 @@ only go to the committed recipient, and consuming the leaf prevents replay. The 
 
 ## Toolchain
 
+- Node 22+
+- Yarn 4 (`corepack enable`)
+- aztec-up (also provides Foundry as `aztec-forge` / `aztec-anvil`):
+
 ```bash
+curl -fsSL https://install.aztec.network | bash
 aztec-up install 6.0.0
 ```
 
