@@ -1,8 +1,9 @@
 > [!WARNING]
-> **This code has not been audited.** It is experimental research software, provided "as is",
-> without warranty of any kind (see [LICENSE](./LICENSE)). A bug in the L1 portal, the forwarder or
-> the Aztec contract can mint unbacked `tornadoETH` or lock or release ETH incorrectly. Do not use
-> it with real funds without your own independent review. See [SECURITY.md](./SECURITY.md).
+> **AI-generated educational code, not audited.** Written with Claude Code and Codex under human
+> review, for learning and research rather than production use. It is provided "as is", without
+> warranty of any kind (see [LICENSE](./LICENSE)). A bug in the L1 portal, the forwarder or the
+> Aztec contract can mint unbacked `tornadoETH` or lock or release ETH incorrectly. Do not use it
+> with real funds without your own independent review. See [SECURITY.md](./SECURITY.md).
 
 # aztec-shielded-portal
 
@@ -46,7 +47,12 @@ only go to the committed recipient, and consuming the leaf prevents replay. The 
 
 ## Toolchain
 
+- Node 22+
+- Yarn 4 (`corepack enable`)
+- aztec-up (also provides Foundry as `aztec-forge` / `aztec-anvil`):
+
 ```bash
+curl -fsSL https://install.aztec.network | bash
 aztec-up install 6.0.0
 ```
 
@@ -76,8 +82,8 @@ yarn portal transfer --to <addr> --amount <wei> [--from <idx|addr>]
 yarn portal burn --recipient-l1 <0x> --amount <wei> [--from <idx|addr>] [--redeem]
 ```
 
-Locally, redemption works without a prover: the local network's `EpochTestSettler` pushes each
-completed epoch's out-hash into the L1 Outbox.
+Locally, redemption works without a prover: the local network settles each epoch synthetically,
+writing its out-hash into the L1 Outbox.
 
 ## Environment
 
@@ -120,23 +126,28 @@ ETH lands at the undeployed forwarder; anyone can then call `ForwarderFactory.br
 with the same proof, which re-verifies it against the pool's verifier and finishes the original
 mint (the SDK does this automatically). Each Tornado nullifier bridges at most once.
 
-Proving is delegated to a caller-supplied `tornado-cli` (`proveViaTornadoCli`); nothing from Tornado
-is vendored.
+Proofs come from Tornado's own circom1/websnark toolchain and proving key, in the isolated, opt-in
+`prover/` package (see [SECURITY.md](./SECURITY.md)).
 
 | Tier | What | Runs |
 | ---- | ---- | ---- |
 | 1 | forwarder vs a real-mimicking mock pool | `yarn test:l1` |
 | 2 | mainnet fork vs real pool bytecode, verifier mocked | `yarn test:l1:fork` |
-| 3 | own `ETHTornado` on a fork vs the **real verifier** | `yarn rehearsal:real-tornado` (operator) |
+| 3 | mainnet fork: **real verifier**, full Aztec round trip | `yarn rehearsal:real-tornado` |
 | 4 | Sepolia + Aztec testnet | [docs/TESTNET.md](./docs/TESTNET.md) |
 
-Tier 3 (operator-only, see [SECURITY.md](./SECURITY.md)):
+Tier 3 deploys a copy of the 1 ETH pool on the fork (its exact bytecode, linked to the canonical
+Hasher and pointed at the canonical Verifier), deposits, proves to our forwarder, and runs the local
+network's L1 contracts on the same fork, so claim → burn → redeem settle against the same L1:
 
 ```bash
-git clone https://github.com/tornadocash/tornado-cli && (cd tornado-cli && npm install)
-aztec-anvil --fork-url "$MAINNET_RPC_URL"
-TORNADO_CLI_DIR=/abs/path/to/tornado-cli L1_RPC_URL=http://localhost:8545 yarn rehearsal:real-tornado
+yarn prover:install
+MAINNET_RPC_URL=https://eth.drpc.org yarn rehearsal:real-tornado
 ```
+
+`--real-pool` uses the canonical pool instead, rebuilding its tree from tornado-cli's event cache plus
+`getLogs`; that needs an RPC serving wide `getLogs` ranges (e.g. Alchemy with
+`LOGS_MAX_RANGE=1000000`). `--l1-only` stops at the portal.
 
 ## Security properties
 

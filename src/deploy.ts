@@ -5,11 +5,13 @@
  *   - Anvil L1 on :8545 (well-known test mnemonic, prefunded)
  *   - Aztec node on :8080 (prefunded Schnorr test accounts)
  *
- * The local network does no real proving; its EpochTestSettler pushes each completed
- * epoch's out-hash into the L1 Outbox (epoch duration = 2 checkpoints), which is what
- * makes L2->L1 redemption work without a prover.
+ * The local network does no real proving; its AutomineSequencer settles each epoch
+ * synthetically, writing the out-hash into the L1 Outbox, which is what makes L2->L1
+ * redemption work without a prover.
  */
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { AztecAddress } from '@aztec-labs/aztec.js/addresses';
 import { Fr } from '@aztec-labs/aztec.js/fields';
@@ -40,7 +42,13 @@ import {
   TornadoEthBridgeL1Abi,
   TornadoEthBridgeL1Bytecode,
 } from './l1-artifacts.js';
-import { computeForwarderAddress, proveViaTornadoCli } from './real-tornado.js';
+import {
+  computeForwarderAddress,
+  proveTornadoWithdrawal,
+  verifyTornadoProof,
+  type TornadoProof,
+} from './real-tornado.js';
+import type { PoolHistory } from './tornado-history.js';
 
 export const DEFAULT_L1_RPC_URL = 'http://localhost:8545';
 export const DEFAULT_L1_CHAIN_ID = foundry.id;
@@ -331,7 +339,7 @@ export interface BridgeStack {
   node: AztecNode;
   wallet: AztecConnection['wallet'];
   accounts: AztecAddress[];
-  /** MockTornadoPool address (denomination = ONE_ETH unless overridden). */
+  /** The Tornado pool the bridge takes deposits from (a mock unless `existingPool` was given). */
   pool: `0x${string}`;
   /** TornadoEthBridgeL1 address. */
   bridge: `0x${string}`;
@@ -351,13 +359,25 @@ export interface BridgeStack {
  * per-commitment Forwarder), backed by a behavioral {MockRealTornadoPool} so the full flow runs
  * locally without snarkjs/circuit artifacts. That path is byte-identical to mainnet from the
  * forwarder onward; only the pool's proof verification is faked.
+ *
+ * With `existingPool` (e.g. the canonical pool on a mainnet fork), no mock is deployed: the forwarder
+ * factory is pointed at that pool and the denomination is read from it.
  */
 export async function setupBridgeStack(
-  opts: { denomination?: bigint; poolLiquidity?: bigint; l1?: L1ClientConfig; useRealTornado?: boolean } = {},
+  opts: {
+    denomination?: bigint;
+    poolLiquidity?: bigint;
+    l1?: L1ClientConfig;
+    useRealTornado?: boolean;
+    existingPool?: `0x${string}`;
+    aztecNodeUrl?: string;
+  } = {},
 ): Promise<BridgeStack> {
-  const denomination = opts.denomination ?? ONE_ETH;
   const l1Client = makeL1Client(opts.l1);
-  const conn = await connectToAztec();
+  const denomination = opts.existingPool
+    ? await readPoolDenomination(l1Client, opts.existingPool)
+    : (opts.denomination ?? ONE_ETH);
+  const conn = await connectToAztec(opts.aztecNodeUrl);
   const deployer = conn.accounts[0];
 
   const bridge = await deployTornadoBridge(l1Client);
@@ -366,7 +386,11 @@ export async function setupBridgeStack(
   let factory: `0x${string}` | undefined;
   let mockKnownRoot: `0x${string}` | undefined;
 
-  if (opts.useRealTornado) {
+  if (opts.existingPool) {
+    pool = opts.existingPool;
+    factory = await deployForwarderFactory(l1Client, bridge, pool);
+    await setForwarderFactory(l1Client, bridge, factory);
+  } else if (opts.useRealTornado) {
     pool = await deployMockRealTornadoPool(l1Client, denomination);
     await fundPool(l1Client, pool, opts.poolLiquidity ?? 10n * denomination);
     mockKnownRoot = MOCK_REAL_KNOWN_ROOT;
@@ -588,9 +612,8 @@ export interface BurnWitness {
 
 /**
  * Wait for the burn's epoch to settle into the Outbox, then compute the membership
- * witness. The local network's EpochTestSettler inserts the out-hash once the epoch
- * (2 checkpoints) completes; we keep producing trivial L2 blocks to push the epoch
- * over the boundary while polling.
+ * witness. The local network inserts the out-hash once the epoch completes; we keep
+ * producing trivial L2 blocks to push the epoch over the boundary while polling.
  */
 export async function getBurnWitness(
   stack: Pick<BridgeStack, 'node' | 'l1Client' | 'token'>,
@@ -608,7 +631,7 @@ export async function getBurnWitness(
       if (witness !== undefined) {
         return true;
       }
-      // Nudge the epoch forward so the EpochTestSettler can settle it.
+      // Nudge the epoch forward so it can settle.
       await advanceL2Blocks(stack.token, blockProducer, 1);
       return false;
     },
@@ -683,24 +706,44 @@ export async function readTornadoVerifier(client: L1Client, pool: `0x${string}`)
   })) as `0x${string}`;
 }
 
+async function readPoolDenomination(client: L1Client, pool: `0x${string}`): Promise<bigint> {
+  return (await client.readContract({
+    address: pool,
+    abi: parseAbi(['function denomination() view returns (uint256)']),
+    functionName: 'denomination',
+  })) as bigint;
+}
+
+const ETH_TORNADO_ARTIFACT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '../prover/assets/build/contracts/ETHTornado.json',
+);
+
 /**
- * Deploy our OWN ETHTornado from tornado-cli's prebuilt `build/contracts/ETHTornado.json` (read from
- * `cliDir` = $TORNADO_CLI_DIR -- nothing Tornado is vendored in this repo). Intended for a mainnet
- * FORK: pass the real on-chain Verifier (via {@link readTornadoVerifier}) so proofs validate against
- * the canonical circom1/websnark trusted setup; the MiMC hasher is the canonical one hardcoded at its
- * mainnet address, present on the fork. (For Sepolia, Phase 4 supplies its own Verifier + Hasher.)
+ * The MiMC Hasher library the canonical ETH pools link. With it, the ETHTornado artifact is
+ * byte-identical (bar the metadata hash) to the deployed 1 ETH pool.
+ */
+export const TORNADO_HASHER_MAINNET = '0x83584f83f26aF4eDDA9CBe8C730bc87C364b28fe' as const;
+
+/**
+ * Deploy our own ETHTornado from tornado-cli's prebuilt artifact (fetched by `yarn prover:install`),
+ * linked to the canonical Hasher. Intended for a mainnet fork, with the real Verifier from
+ * {@link readTornadoVerifier}.
  */
 export async function deployOwnTornadoPool(
   client: L1Client,
-  cliDir: string,
   opts: { verifier: `0x${string}`; denomination?: bigint; merkleTreeHeight?: number; operator?: `0x${string}` },
 ): Promise<`0x${string}`> {
-  const artifact = JSON.parse(readFileSync(`${cliDir}/build/contracts/ETHTornado.json`, 'utf8')) as {
-    abi: Abi;
-    bytecode: string;
-  };
+  const artifact = JSON.parse(readFileSync(ETH_TORNADO_ARTIFACT, 'utf8')) as { abi: Abi; bytecode: string };
+  if (!(await client.getCode({ address: TORNADO_HASHER_MAINNET }))) {
+    throw new Error(`no Tornado Hasher at ${TORNADO_HASHER_MAINNET}; deployOwnTornadoPool needs a mainnet fork`);
+  }
+  const bytecode = artifact.bytecode.replaceAll(
+    '__Hasher________________________________',
+    TORNADO_HASHER_MAINNET.slice(2).toLowerCase(),
+  ) as `0x${string}`;
   const operator = opts.operator ?? (client.account!.address as `0x${string}`);
-  return deployL1ContractChecked(client, artifact.abi, artifact.bytecode as `0x${string}`, [
+  return deployL1ContractChecked(client, artifact.abi, bytecode, [
     opts.verifier,
     opts.denomination ?? ONE_ETH,
     opts.merkleTreeHeight ?? 20,
@@ -906,20 +949,25 @@ export async function withdrawFromMockRealPool(
   );
 }
 
+export interface RealTornadoWithdrawal {
+  payload: ForwarderPayload;
+  /** The proof plus its public args, as the pool's verifier sees them. */
+  proof: TornadoProof;
+  verifier: `0x${string}`;
+}
+
 /**
- * Real-path withdrawal: derive the forwarder from the Aztec mint commitment, generate a real Tornado
- * Classic proof bound to it via a BYO tornado-cli (`opts.cliDir` = $TORNADO_CLI_DIR), and drive the
- * factory. `opts.leaves` is the pool's ordered commitment set INCLUDING ours (for a freshly
- * self-deployed pool whose only deposit is ours, just `[ourCommitment]`). The proof RUN needs
- * tornado-cli installed -- the operator's consented step (see SECURITY.md); it is exercised only by
- * the env-gated fork rehearsal, never by the offline suite.
+ * Prove a real Tornado withdrawal to the forwarder of a fresh Aztec mint commitment, and require
+ * the pool's own verifier to accept it before anything is sent. `history` must contain our deposit;
+ * the prover refuses any rebuilt root other than `history.root`.
  */
-export async function withdrawFromRealTornadoToBridge(
-  stack: Pick<BridgeStack, 'l1Client' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
+export async function prepareRealTornadoWithdrawal(
+  stack: Pick<BridgeStack, 'l1Client' | 'pool' | 'denomination'> & { factory: `0x${string}` },
   recipient: AztecAddress,
   note: string,
-  opts: { cliDir: string; leaves: Array<`0x${string}` | string>; mintSecret?: Fr },
-): Promise<TornadoDeposit> {
+  history: PoolHistory,
+  opts: { mintSecret?: Fr } = {},
+): Promise<RealTornadoWithdrawal> {
   const forwarderInitCodeHash = (await stack.l1Client.readContract({
     address: stack.factory,
     abi: ForwarderFactoryAbi,
@@ -928,18 +976,28 @@ export async function withdrawFromRealTornadoToBridge(
 
   const mintSecret = opts.mintSecret ?? generateMintSecret();
   const commitment = await computeAztecMintCommitment(recipient, mintSecret, stack.denomination);
-  const forwarder = computeForwarderAddress(
-    stack.factory,
-    commitment.toString() as `0x${string}`,
-    forwarderInitCodeHash,
-  );
+  const forwarder = computeForwarderAddress(stack.factory, commitment.toString() as `0x${string}`, forwarderInitCodeHash);
 
-  const { proof, root, nullifierHash } = proveViaTornadoCli({
-    cliDir: opts.cliDir,
-    note,
-    recipient: forwarder,
-    leaves: opts.leaves,
-  });
+  const proof = proveTornadoWithdrawal({ note, recipient: forwarder, leaves: history.leaves, expectedRoot: history.root });
+  const verifier = await readTornadoVerifier(stack.l1Client, stack.pool);
+  if (!(await verifyTornadoProof(stack.l1Client, verifier, proof.proof, proof.args))) {
+    throw new Error(`Tornado verifier ${verifier} rejected the generated proof`);
+  }
+  return {
+    payload: { proof: proof.proof, root: proof.root, nullifierHash: proof.nullifierHash, commitment, mintSecret },
+    proof,
+    verifier,
+  };
+}
 
-  return withdrawViaForwarder(stack, { proof, root, nullifierHash, commitment, mintSecret });
+/** {@link prepareRealTornadoWithdrawal}, then bridge it through the forwarder factory. */
+export async function withdrawFromRealTornadoToBridge(
+  stack: Pick<BridgeStack, 'l1Client' | 'pool' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
+  recipient: AztecAddress,
+  note: string,
+  history: PoolHistory,
+  opts: { mintSecret?: Fr } = {},
+): Promise<TornadoDeposit> {
+  const { payload } = await prepareRealTornadoWithdrawal(stack, recipient, note, history, opts);
+  return withdrawViaForwarder(stack, payload);
 }

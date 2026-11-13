@@ -1,163 +1,244 @@
 /**
- * Real-Tornado rehearsal: a REAL Groth16 (circom1/websnark) proof, accepted by the REAL Tornado
- * verifier, driving the full forwarder -> portal handoff -- on a mainnet fork, no real funds.
+ * Real-Tornado rehearsal on a mainnet fork (README "Real Tornado (Classic)", tier 3). The pool
+ * defaults to our own ETHTornado: the canonical 1 ETH pool's exact code, Hasher and real Verifier,
+ * with our deposit as its only leaf, so no history is needed.
  *
- * This is the rung that proves our off-chain proof plumbing (pedersen/MiMC derivations, public-signal
- * ordering, the Groth16->Solidity proof packing) is byte-accepted by the actual mainnet verifier --
- * the one thing the Tier 2 forge fork test mocks out. It is L1-only (the Aztec claim is exercised by
- * the sandbox e2e + the Phase 4 Sepolia rehearsal).
+ * Flags:
+ *   --real-pool  use the canonical 1 ETH pool instead; rebuilding its ~12M-block log tail needs an RPC
+ *                that serves wide eth_getLogs ranges (set LOGS_MAX_RANGE, e.g. 1000000 on Alchemy)
+ *   --l1-only    stop after the portal locks the ETH; Aztec messaging is mocked, no local network
  *
- * Design (resolves "self-deployed pool" + "local anvil WITH fork"): we deploy our OWN `ETHTornado`
- * on the fork, pointed at the REAL on-chain Verifier (+ the canonical MiMC hasher hardcoded at its
- * mainnet address, present on the fork), deposit a single leaf we own, and prove against our fresh
- * root. So we validate packing against the real verifier with NO mainnet leaf history.
- *
- * PREREQUISITES (none are bundled here; running this is the operator's consented step -- see
- * SECURITY.md):
- *   1. A mainnet fork: `aztec-anvil --fork-url $MAINNET_RPC_URL` -- then set L1_RPC_URL to it.
- *   2. A tornado-cli checkout with deps installed, and TORNADO_CLI_DIR pointing at it:
- *        git clone https://github.com/tornadocash/tornado-cli && cd tornado-cli && npm install
- *      (tornado-cli ships the circom1/websnark toolchain + the ETHTornado artifact we deploy from.)
- *
- * VALIDATE: if the real verifier rejects the proof, the most likely culprit is tornado-cli's proof
- * packing assumptions vs our pinned tornado-cli commit -- re-pin tornado-cli, or compare against its
- * own `withdraw` command output.
+ * Env: MAINNET_RPC_URL (starts the fork + local network), or L1_RPC_URL [+ AZTEC_NODE_URL] to attach
+ * to a fork already running with chain id 31337. Needs `yarn prover:install`.
  */
 import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
 import { EthAddress } from '@aztec-labs/foundation/eth-address';
-import { type Abi, parseAbi } from 'viem';
+import { type Abi, createPublicClient, http, parseAbi } from 'viem';
 
 import MockInboxJson from '../contracts/l1/out/MessagingMocks.sol/MockInbox.json' with { type: 'json' };
 import MockOutboxJson from '../contracts/l1/out/MessagingMocks.sol/MockOutbox.json' with { type: 'json' };
 import MockRegistryJson from '../contracts/l1/out/MessagingMocks.sol/MockRegistry.json' with { type: 'json' };
 import MockRollupJson from '../contracts/l1/out/MessagingMocks.sol/MockRollup.json' with { type: 'json' };
 import {
+  balanceOfPrivate,
+  burnForL1Withdrawal,
+  claimTornadoEth,
+  createTornadoNote,
   deployForwarderFactory,
+  deployL1ContractChecked,
   deployOwnTornadoPool,
   deployTornadoBridge,
+  getBurnWitness,
   getTotalLockedEth,
   initializeBridge,
+  loadDepositCache,
   makeL1Client,
+  makeMessageConsumable,
   ONE_ETH,
+  prepareRealTornadoWithdrawal,
   readTornadoVerifier,
+  rebuildPoolHistory,
   setForwarderFactory,
-  TEST_MNEMONIC,
-  withdrawFromRealTornadoToBridge,
-  type L1Client,
-  deployL1ContractChecked,
+  setupBridgeStack,
+  TORNADO_1ETH_MAINNET,
+  verifyTornadoProof,
   waitForL1Success,
+  withdrawFromAztecOnL1,
+  withdrawViaForwarder,
+  type L1Client,
 } from '../src/index.js';
-import { createTornadoNoteViaCli, TORNADO_1ETH_MAINNET } from '../src/real-tornado.js';
+import { startForkNetwork, type ForkNetwork } from './fork-network.js';
 
-const tornadoDepositAbi = parseAbi(['function deposit(bytes32 _commitment) external payable']);
+const poolAbi = parseAbi([
+  'function deposit(bytes32 _commitment) payable',
+  'function nullifierHashes(bytes32) view returns (bool)',
+]);
+/** Fresh EOA that only ever receives the redemption. */
+const L1_RECIPIENT = '0x2000000000000000000000000000000000000002' as const;
+/** Anvil test-mnemonic index for our L1 txs; index 0 is the Aztec sequencer's publisher. */
+const L1_ACCOUNT_INDEX = 3;
 
-function requireEnv(name: string, hint: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} is required (${hint})`);
-  }
-  return value;
+export interface RehearsalResult {
+  mode: 'full' | 'l1-only';
+  pool: `0x${string}`;
+  verifier: `0x${string}`;
+  forkBlock: bigint;
+  leaves: number;
+  depositId: `0x${string}`;
+  /** ETH the L1 recipient received from the redemption (full mode). */
+  redeemed?: bigint;
 }
 
-async function deployMock(
-  client: L1Client,
-  json: { abi: unknown; bytecode: { object: string } },
-  args: unknown[],
-): Promise<`0x${string}`> {
+/** Print getLogs progress roughly every 500k blocks. */
+function logProgress(): (block: bigint) => void {
+  let next = 0n;
+  return block => {
+    if (block >= next) {
+      console.log(`  logs through block ${block}`);
+      next = block + 500_000n;
+    }
+  };
+}
+
+function assert(cond: unknown, msg: string): asserts cond {
+  if (!cond) {
+    throw new Error(`rehearsal check failed: ${msg}`);
+  }
+}
+
+async function assertAnvilFork(client: L1Client): Promise<void> {
+  const rpc = client as unknown as { request(args: { method: string }): Promise<unknown> };
+  const info = (await rpc.request({ method: 'anvil_nodeInfo' }).catch(() => undefined)) as
+    | { forkConfig?: { forkUrl?: string | null } }
+    | undefined;
+  assert(info?.forkConfig?.forkUrl, 'L1 must be an Anvil mainnet fork (refusing to spend real funds)');
+  assert((await client.getChainId()) === 31337, 'the fork must run with --chain-id 31337');
+}
+
+async function deployMock(client: L1Client, json: { abi: unknown; bytecode: { object: string } }, args: unknown[]) {
   return deployL1ContractChecked(client, json.abi as Abi, json.bytecode.object as `0x${string}`, args);
 }
 
-export interface RehearsalResult {
-  bridge: `0x${string}`;
-  factory: `0x${string}`;
-  ownTornado: `0x${string}`;
-  lockedEth: bigint;
-  depositId: `0x${string}`;
-}
-
-/**
- * Refuse to run anywhere but an Anvil mainnet fork. The rehearsal deploys contracts and deposits
- * 1 ETH from the signer (which may come from L1_PRIVATE_KEY/L1_MNEMONIC), so a live endpoint would
- * spend real funds.
- */
-async function assertAnvilFork(client: L1Client): Promise<void> {
-  const rpc = client as unknown as { request(args: { method: string }): Promise<unknown> };
-  let info: { forkConfig?: { forkUrl?: string | null } };
-  try {
-    info = (await rpc.request({ method: 'anvil_nodeInfo' })) as typeof info;
-  } catch {
-    throw new Error('L1_RPC_URL is not an Anvil node. The rehearsal only runs on `aztec-anvil --fork-url <mainnet>`.');
-  }
-  if (!info?.forkConfig?.forkUrl) {
-    throw new Error('L1_RPC_URL is Anvil but not a fork. Start it with `aztec-anvil --fork-url <mainnet>`.');
-  }
-}
-
-export async function runRealTornadoRehearsal(
-  opts: { rpcUrl?: string; chainId?: number; cliDir?: string; realPool?: `0x${string}` } = {},
-): Promise<RehearsalResult> {
-  const cliDir = opts.cliDir ?? requireEnv('TORNADO_CLI_DIR', 'a tornado-cli checkout with deps installed');
-  const client = makeL1Client({
-    rpcUrl: opts.rpcUrl ?? requireEnv('L1_RPC_URL', 'a mainnet fork endpoint, e.g. aztec-anvil --fork-url'),
-    chainId: opts.chainId ?? Number(process.env.L1_CHAIN_ID ?? 1),
-    mnemonic: process.env.L1_MNEMONIC ?? TEST_MNEMONIC,
-  });
-  await assertAnvilFork(client);
-
-  // 1. Our own ETHTornado on the fork, pointed at the REAL verifier read from the canonical pool.
-  const realPool = opts.realPool ?? TORNADO_1ETH_MAINNET;
-  const verifier = await readTornadoVerifier(client, realPool);
-  console.log(`Deploying our own ETHTornado (verifier=${verifier}) on the fork...`);
-  const ownTornado = await deployOwnTornadoPool(client, cliDir, { verifier });
-
-  // 2. A fresh note (via tornado-cli's pedersen), deposited so we own the only leaf.
-  console.log('Generating + depositing a fresh Tornado note...');
-  const { note, commitment } = createTornadoNoteViaCli(cliDir);
-  const depositHash = await client.writeContract({
-    address: ownTornado,
-    abi: tornadoDepositAbi,
-    functionName: 'deposit',
-    args: [commitment],
-    value: ONE_ETH,
-    account: client.account!,
-    chain: client.chain,
-  });
-  await waitForL1Success(client, depositHash);
-
-  // 3. L1-only Aztec messaging stubs + the bridge + a forwarder factory pointed at our pool.
-  console.log('Deploying messaging mocks + bridge + forwarder factory...');
+/** L1-only stack: the portal wired to mock Aztec messaging, forwarder factory pointed at `pool`. */
+async function setupL1OnlyStack(client: L1Client, pool: `0x${string}`) {
   const inbox = await deployMock(client, MockInboxJson, []);
   const outbox = await deployMock(client, MockOutboxJson, []);
   const rollup = await deployMock(client, MockRollupJson, [inbox, outbox, 1n]);
   const registry = await deployMock(client, MockRegistryJson, [rollup]);
   const bridge = await deployTornadoBridge(client);
   await initializeBridge(client, bridge, EthAddress.fromString(registry), await AztecAddress.random());
-  const factory = await deployForwarderFactory(client, bridge, ownTornado);
+  const factory = await deployForwarderFactory(client, bridge, pool);
   await setForwarderFactory(client, bridge, factory);
+  return { l1Client: client, pool, bridge, factory, denomination: ONE_ETH };
+}
 
-  // 4. Real proof bound to the forwarder -> factory -> portal. Our pool's only leaf is ours.
-  console.log('Generating the real proof and bridging...');
-  const recipient = await AztecAddress.random();
-  const deposit = await withdrawFromRealTornadoToBridge(
-    { l1Client: client, bridge, denomination: ONE_ETH, factory },
-    recipient,
-    note,
-    { cliDir, leaves: [commitment] },
-  );
-
-  const lockedEth = await getTotalLockedEth(client, bridge);
-  if (lockedEth !== ONE_ETH) {
-    throw new Error(`Expected bridge to lock ${ONE_ETH} wei, got ${lockedEth}`);
+export async function runRealTornadoRehearsal(
+  opts: { realPool?: boolean; l1Only?: boolean } = {},
+): Promise<RehearsalResult> {
+  let network: ForkNetwork | undefined;
+  if (process.env.MAINNET_RPC_URL) {
+    console.log('Starting the mainnet fork' + (opts.l1Only ? '' : ' and the Aztec local network') + '...');
+    network = await startForkNetwork({ forkUrl: process.env.MAINNET_RPC_URL, withAztec: !opts.l1Only });
   }
-  console.log(`OK: real proof accepted, bridge locked ${lockedEth} wei (depositId ${deposit.depositId}).`);
+  try {
+    const l1RpcUrl = network?.l1RpcUrl ?? process.env.L1_RPC_URL;
+    assert(l1RpcUrl, 'set MAINNET_RPC_URL, or L1_RPC_URL for an already-running fork');
+    const aztecNodeUrl = network?.aztecNodeUrl ?? process.env.AZTEC_NODE_URL;
+    const l1 = { rpcUrl: l1RpcUrl, chainId: 31337, addressIndex: L1_ACCOUNT_INDEX };
+    const client = makeL1Client(l1);
+    await assertAnvilFork(client);
+    const forkBlock = network?.forkBlock ?? (await client.getBlockNumber());
 
-  return { bridge, factory, ownTornado, lockedEth, depositId: deposit.depositId };
+    let pool: `0x${string}` = TORNADO_1ETH_MAINNET;
+    let poolDeployBlock: bigint | undefined;
+    if (!opts.realPool) {
+      pool = await deployOwnTornadoPool(client, { verifier: await readTornadoVerifier(client, TORNADO_1ETH_MAINNET) });
+      poolDeployBlock = await client.getBlockNumber();
+    }
+
+    console.log(`Deploying the portal stack against pool ${pool}...`);
+    const full = opts.l1Only ? undefined : await setupBridgeStack({ existingPool: pool, l1, aztecNodeUrl });
+    const stack = full ? { ...full, factory: full.factory! } : await setupL1OnlyStack(client, pool);
+    const alice = full ? full.accounts[0] : await AztecAddress.random();
+
+    const { note, commitment } = createTornadoNote();
+    const depositReceipt = await waitForL1Success(
+      client,
+      await client.writeContract({
+        address: pool,
+        abi: poolAbi,
+        functionName: 'deposit',
+        args: [commitment],
+        value: ONE_ETH,
+        account: client.account!,
+        chain: client.chain,
+      }),
+    );
+    console.log('Rebuilding the pool tree from the deposit cache + logs...');
+    const history = await rebuildPoolHistory({
+      client,
+      pool,
+      blockNumber: depositReceipt.blockNumber,
+      cache: opts.realPool ? loadDepositCache() : undefined,
+      fromBlock: poolDeployBlock,
+      upstream: process.env.MAINNET_RPC_URL
+        ? createPublicClient({ transport: http(process.env.MAINNET_RPC_URL) })
+        : undefined,
+      forkBlock,
+      maxRange: process.env.LOGS_MAX_RANGE ? BigInt(process.env.LOGS_MAX_RANGE) : undefined,
+      onProgress: logProgress(),
+    });
+    assert(history.leaves.at(-1) === commitment.toLowerCase(), 'our deposit is the last leaf');
+    console.log(`${history.leaves.length} leaves, root ${history.root}`);
+
+    console.log('Proving (circom1/websnark) and checking against the real verifier...');
+    const withdrawal = await prepareRealTornadoWithdrawal(stack, alice, note, history);
+    const tampered = [...withdrawal.proof.args] as typeof withdrawal.proof.args;
+    tampered[2] = `0x${'00'.repeat(19)}01`;
+    assert(
+      !(await verifyTornadoProof(client, withdrawal.verifier, withdrawal.proof.proof, tampered)),
+      'the verifier must reject the proof for a different recipient',
+    );
+
+    const deposit = await withdrawViaForwarder(stack, withdrawal.payload);
+    assert((await getTotalLockedEth(client, stack.bridge)) === ONE_ETH, 'portal locked the denomination');
+    assert(
+      await client.readContract({
+        address: pool,
+        abi: poolAbi,
+        functionName: 'nullifierHashes',
+        args: [withdrawal.payload.nullifierHash],
+      }),
+      'the Tornado nullifier is spent',
+    );
+    console.log(`Portal locked 1 ETH (depositId ${deposit.depositId}).`);
+
+    const result: RehearsalResult = {
+      mode: opts.l1Only ? 'l1-only' : 'full',
+      pool,
+      verifier: withdrawal.verifier,
+      forkBlock,
+      leaves: history.leaves.length,
+      depositId: deposit.depositId,
+    };
+    if (!full) {
+      return result;
+    }
+
+    console.log('Claiming on Aztec...');
+    await makeMessageConsumable(full, deposit, alice);
+    await claimTornadoEth(full.token, alice, deposit);
+    assert((await balanceOfPrivate(full.token, alice)) === ONE_ETH, 'alice holds 1 private tornadoETH');
+
+    console.log('Burning and redeeming on L1...');
+    const burn = await burnForL1Withdrawal(full, alice, L1_RECIPIENT, ONE_ETH);
+    assert((await balanceOfPrivate(full.token, alice)) === 0n, 'burn consumed the notes');
+    const witness = await getBurnWitness(full, burn, alice);
+    const before = await client.getBalance({ address: L1_RECIPIENT });
+    await withdrawFromAztecOnL1(full, burn, witness);
+    const redeemed = (await client.getBalance({ address: L1_RECIPIENT })) - before;
+    assert(redeemed === ONE_ETH, 'recipient received 1 ETH');
+    assert((await getTotalLockedEth(client, full.bridge)) === 0n, 'portal reserve is empty');
+    const replay = await withdrawFromAztecOnL1(full, burn, witness).then(
+      () => true,
+      () => false,
+    );
+    assert(!replay, 'redeeming the same burn twice must fail');
+
+    console.log('OK: real proof accepted by the real verifier; full round trip settled on the fork.');
+    return { ...result, redeemed };
+  } finally {
+    network?.stop();
+  }
 }
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  runRealTornadoRehearsal()
-    .then(() => process.exit(0))
+  runRealTornadoRehearsal({ realPool: process.argv.includes('--real-pool'), l1Only: process.argv.includes('--l1-only') })
+    .then(result => {
+      console.log(JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
+      process.exit(0);
+    })
     .catch(err => {
       console.error(err);
       process.exit(1);

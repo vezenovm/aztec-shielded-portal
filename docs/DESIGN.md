@@ -25,7 +25,9 @@ Protocol reality required a few interface adjustments; the substance is unchange
 6. `TornadoBridgeDeposit` additionally emits `(messageKey, messageLeafIndex)` so clients
    don't need to recompute them.
 
-## Adding another bridge (e.g. privacyPoolsETH)
+## Adding another bridge
+
+Examples: `privacyPoolsETH`, `railgunETH`.
 
 Per-origin assets stay isolated so provenance is obvious. The recipe:
 

@@ -9,3 +9,5 @@ config.local.json
 .tsbuildinfo
 *.log
 portal-state.json
+prover/assets/
+.rehearsal/

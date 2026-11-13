@@ -9,7 +9,7 @@ This is an unaudited research PoC (see [README](./README.md) and [SECURITY.md](.
   `contracts/aztec/tornado_eth_token/Nargo.toml`, and the `aztec-up` toolchain (incl. `aztec-forge`).
   Bump them together.
 - Noir comments must be **ASCII** (em-dashes/Unicode break `aztec compile`).
-- Nothing from Tornado Cash is vendored — the real-proof path uses a caller-supplied `tornado-cli`.
+- Nothing from Tornado Cash is committed; see [SECURITY.md](./SECURITY.md#real-tornado-integration).
 
 ## Must stay green (offline, no network)
 
@@ -26,5 +26,8 @@ yarn test:aztec && yarn test:e2e
 
 ## Operator-only (never in CI)
 
-The real-Tornado fork rehearsal (`yarn test:fork` / `yarn rehearsal:real-tornado`) needs a BYO
-`tornado-cli` (`$TORNADO_CLI_DIR`) and a mainnet fork. See [SECURITY.md](./SECURITY.md).
+The real-Tornado fork rehearsal: see the [README](./README.md#real-tornado-classic). As a test:
+`RUN_REAL_TORNADO=1 MAINNET_RPC_URL=... yarn test:fork`.
+
+Regenerating `prover/package-lock.json`: `npm --prefix prover install --ignore-scripts`, then rewrite
+its `git+ssh://git@github.com/` URLs to `git+https://github.com/` so `npm ci` works without SSH keys.
