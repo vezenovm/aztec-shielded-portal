@@ -20,6 +20,7 @@ import MockOutboxJson from '../contracts/l1/out/MessagingMocks.sol/MockOutbox.js
 import MockRegistryJson from '../contracts/l1/out/MessagingMocks.sol/MockRegistry.json' with { type: 'json' };
 import MockRollupJson from '../contracts/l1/out/MessagingMocks.sol/MockRollup.json' with { type: 'json' };
 import {
+  approveForwarderFactory,
   balanceOfPrivate,
   burnForL1Withdrawal,
   claimTornadoEth,
@@ -38,7 +39,6 @@ import {
   prepareRealTornadoWithdrawal,
   readTornadoVerifier,
   rebuildPoolHistory,
-  setForwarderFactory,
   setupBridgeStack,
   TORNADO_1ETH_MAINNET,
   verifyTornadoProof,
@@ -108,7 +108,7 @@ async function setupL1OnlyStack(client: L1Client, pool: `0x${string}`) {
   const bridge = await deployTornadoBridge(client);
   await initializeBridge(client, bridge, EthAddress.fromString(registry), await AztecAddress.random());
   const factory = await deployForwarderFactory(client, bridge, pool);
-  await setForwarderFactory(client, bridge, factory);
+  await approveForwarderFactory(client, bridge, factory);
   return { l1Client: client, pool, bridge, factory, denomination: ONE_ETH };
 }
 

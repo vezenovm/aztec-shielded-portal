@@ -15,8 +15,14 @@ import {ITornadoWithdrawalReceiver} from "./ITornadoWithdrawalReceiver.sol";
  * {ForwarderFactory} so the two contracts stay a single source of truth.
  */
 interface IForwarderFactory {
+  function PORTAL() external view returns (address);
   function FORWARDER_INIT_CODE_HASH() external view returns (bytes32);
   function DENOMINATION() external view returns (uint256);
+}
+
+/// @notice The one getter the portal reads from a caller claiming to be a {Forwarder}.
+interface IForwarderLike {
+  function FACTORY() external view returns (address);
 }
 
 /**
@@ -58,12 +64,15 @@ contract TornadoEthBridgeL1 is ITornadoWithdrawalReceiver {
   mapping(bytes32 depositId => bool consumed) public consumedDepositIds;
   uint256 public totalLockedEth;
 
-  /// @notice Approved {ForwarderFactory} for real Tornado withdrawals (the Option-B ingress path).
-  address public approvedForwarderFactory;
-  /// @notice CREATE2 init-code hash of the factory's Forwarder, for re-deriving forwarder addresses.
-  bytes32 public forwarderInitCodeHash;
-  /// @notice Denomination pinned to the forwarder ingress path (matches the factory's pool).
-  uint256 public forwarderDenomination;
+  /// @notice A {ForwarderFactory} approved as real-Tornado ingress, one per pool (0.1/1/10/100 ETH).
+  struct ForwarderFactoryConfig {
+    /// @dev CREATE2 init-code hash of the factory's Forwarder, for re-deriving forwarder addresses.
+    bytes32 initCodeHash;
+    /// @dev The factory's pool denomination; zero means not approved.
+    uint256 denomination;
+  }
+
+  mapping(address factory => ForwarderFactoryConfig config) public forwarderFactories;
 
   uint256 private _reentrancyLock = 1;
 
@@ -77,7 +86,7 @@ contract TornadoEthBridgeL1 is ITornadoWithdrawalReceiver {
 
   event PoolApproved(address indexed pool, uint256 denomination);
 
-  event ForwarderFactorySet(address indexed factory, bytes32 forwarderInitCodeHash, uint256 denomination);
+  event ForwarderFactoryApproved(address indexed factory, bytes32 forwarderInitCodeHash, uint256 denomination);
 
   event TornadoBridgeDeposit(
     address indexed pool,
@@ -175,20 +184,24 @@ contract TornadoEthBridgeL1 is ITornadoWithdrawalReceiver {
   }
 
   /**
-   * @notice Approve a {ForwarderFactory} as the real-Tornado ingress and pin its forwarder
-   * init-code hash + denomination (read from the factory so they cannot drift apart).
+   * @notice Approve a {ForwarderFactory} as real-Tornado ingress and pin its forwarder init-code
+   * hash + denomination (read from the factory so they cannot drift apart). Additive: approve one
+   * factory per pool, so notes from every denomination mint the same tornadoETH and can be merged
+   * on Aztec.
    * @dev Owner-gated. A malicious factory cannot mint unbacked tokens: any forwarder it produces
-   * must still deliver `forwarderDenomination` ETH to lock. The only owner power here is over
+   * must still deliver its pinned denomination to lock. The only owner power here is over
    * provenance scope, never over reserves.
    */
-  function setForwarderFactory(address _factory) external onlyOwner {
+  function approveForwarderFactory(address _factory) external onlyOwner {
     require(_factory != address(0), InvalidFactory());
+    require(IForwarderFactory(_factory).PORTAL() == address(this), InvalidFactory());
+    uint256 denomination = IForwarderFactory(_factory).DENOMINATION();
+    require(denomination != 0, InvalidDenomination());
+    bytes32 initCodeHash = IForwarderFactory(_factory).FORWARDER_INIT_CODE_HASH();
 
-    approvedForwarderFactory = _factory;
-    forwarderInitCodeHash = IForwarderFactory(_factory).FORWARDER_INIT_CODE_HASH();
-    forwarderDenomination = IForwarderFactory(_factory).DENOMINATION();
+    forwarderFactories[_factory] = ForwarderFactoryConfig({initCodeHash: initCodeHash, denomination: denomination});
 
-    emit ForwarderFactorySet(_factory, forwarderInitCodeHash, forwarderDenomination);
+    emit ForwarderFactoryApproved(_factory, initCodeHash, denomination);
   }
 
   /* -------------------------------------------------------------------------- */
@@ -230,11 +243,15 @@ contract TornadoEthBridgeL1 is ITornadoWithdrawalReceiver {
    * @notice Authorize the caller as a legitimate ETH source and return its pinned denomination.
    * @dev Two accepted ingress paths:
    *  1. An owner-approved pool that calls back directly (the mock, or any cooperating pool).
-   *  2. A per-commitment {Forwarder} deployed by the approved {ForwarderFactory}, whose address is
+   *  2. A per-commitment {Forwarder} deployed by an approved {ForwarderFactory}, whose address is
    *     a CREATE2 binding to the commitment. This is how a REAL Tornado withdrawal attaches the
    *     Aztec recipient: Tornado's plain-ETH push carries no data, so the binding lives in the
    *     proof-bound `recipient` (== this forwarder address). Re-deriving it here and matching it
    *     against msg.sender is what makes the commitment unforgeable.
+   *
+   *     The caller names its factory via `FACTORY()`. That answer is untrusted but only selects
+   *     which approved factory's CREATE2 derivation to check; a caller that lies cannot reproduce
+   *     its own address from another factory, so it is rejected like any unapproved pool.
    */
   function _authorizeIngress(address _pool, bytes32 _aztecMintCommitment)
     internal
@@ -244,25 +261,31 @@ contract TornadoEthBridgeL1 is ITornadoWithdrawalReceiver {
     if (approvedPools[_pool]) {
       return poolDenomination[_pool];
     }
-    if (
-      approvedForwarderFactory != address(0)
-        && _pool == _computeForwarderAddress(_aztecMintCommitment)
-    ) {
-      return forwarderDenomination;
+    // Low-level so a caller without FACTORY() (an EOA, a rogue pool) falls through to the revert.
+    (bool ok, bytes memory ret) = _pool.staticcall(abi.encodeCall(IForwarderLike.FACTORY, ()));
+    if (ok && ret.length == 32) {
+      address factory = abi.decode(ret, (address));
+      ForwarderFactoryConfig memory config = forwarderFactories[factory];
+      if (
+        config.denomination != 0
+          && _pool == _computeForwarderAddress(factory, config.initCodeHash, _aztecMintCommitment)
+      ) {
+        return config.denomination;
+      }
     }
     revert PoolNotApproved(_pool);
   }
 
   /// @notice CREATE2 address of the forwarder bound to a commitment (mirrors ForwarderFactory).
-  function _computeForwarderAddress(bytes32 _aztecMintCommitment) internal view returns (address) {
+  function _computeForwarderAddress(address _factory, bytes32 _initCodeHash, bytes32 _aztecMintCommitment)
+    internal
+    pure
+    returns (address)
+  {
     return address(
       uint160(
         uint256(
-          keccak256(
-            abi.encodePacked(
-              bytes1(0xff), approvedForwarderFactory, _aztecMintCommitment, forwarderInitCodeHash
-            )
-          )
+          keccak256(abi.encodePacked(bytes1(0xff), _factory, _aztecMintCommitment, _initCodeHash))
         )
       )
     );

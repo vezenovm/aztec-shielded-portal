@@ -20,6 +20,19 @@ contract SpoofPool {
   }
 }
 
+/// @notice Claims an approved factory via FACTORY() without being that factory's CREATE2 forwarder.
+contract LyingForwarder {
+  address public immutable FACTORY;
+
+  constructor(address _factory) {
+    FACTORY = _factory;
+  }
+
+  function attack(TornadoEthBridgeL1 _bridge, bytes32 _nullifierHash, bytes32 _commitment) external payable {
+    _bridge.onTornadoWithdrawal{value: msg.value}(address(this), _nullifierHash, _commitment);
+  }
+}
+
 contract ForwarderTest is Test {
   uint256 internal constant DENOMINATION = 1 ether;
   uint256 internal constant ROLLUP_VERSION = 42;
@@ -59,7 +72,7 @@ contract ForwarderTest is Test {
     pool.setKnownRoot(ROOT, true);
 
     factory = new ForwarderFactory(address(bridge), ITornadoInstance(address(pool)));
-    bridge.setForwarderFactory(address(factory));
+    bridge.approveForwarderFactory(address(factory));
   }
 
   /* ------------------------------ Helpers ------------------------------ */
@@ -80,21 +93,27 @@ contract ForwarderTest is Test {
 
   /* -------------------------- Configuration wiring -------------------------- */
 
-  function test_SetForwarderFactoryConfiguresPortal() public view {
-    assertEq(bridge.approvedForwarderFactory(), address(factory));
-    assertEq(bridge.forwarderDenomination(), DENOMINATION);
-    assertEq(bridge.forwarderInitCodeHash(), factory.FORWARDER_INIT_CODE_HASH());
+  function test_ApproveForwarderFactoryConfiguresPortal() public view {
+    (bytes32 initCodeHash, uint256 denomination) = bridge.forwarderFactories(address(factory));
+    assertEq(denomination, DENOMINATION);
+    assertEq(initCodeHash, factory.FORWARDER_INIT_CODE_HASH());
   }
 
-  function test_RevertWhen_SetForwarderFactoryByNonOwner() public {
+  function test_RevertWhen_ApproveForwarderFactoryByNonOwner() public {
     vm.prank(user);
     vm.expectRevert(TornadoEthBridgeL1.NotOwner.selector);
-    bridge.setForwarderFactory(address(factory));
+    bridge.approveForwarderFactory(address(factory));
   }
 
-  function test_RevertWhen_SetForwarderFactoryZero() public {
+  function test_RevertWhen_ApproveForwarderFactoryZero() public {
     vm.expectRevert(TornadoEthBridgeL1.InvalidFactory.selector);
-    bridge.setForwarderFactory(address(0));
+    bridge.approveForwarderFactory(address(0));
+  }
+
+  function test_RevertWhen_ApproveForwarderFactoryForAnotherPortal() public {
+    ForwarderFactory foreign = new ForwarderFactory(makeAddr("otherPortal"), ITornadoInstance(address(pool)));
+    vm.expectRevert(TornadoEthBridgeL1.InvalidFactory.selector);
+    bridge.approveForwarderFactory(address(foreign));
   }
 
   /* ------------------------ Happy path: real-Tornado ingress ------------------------ */
@@ -190,6 +209,87 @@ contract ForwarderTest is Test {
 
     vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.PoolNotApproved.selector, address(spoof)));
     spoof.attack{value: 1 ether}(bridge, NULLIFIER, COMMITMENT);
+  }
+
+  function test_RevertWhen_ForwarderLiesAboutFactory() public {
+    LyingForwarder liar = new LyingForwarder(address(factory));
+    vm.deal(address(liar), DENOMINATION);
+
+    vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.PoolNotApproved.selector, address(liar)));
+    liar.attack{value: DENOMINATION}(bridge, NULLIFIER, COMMITMENT);
+  }
+
+  function test_RevertWhen_FactoryNotApproved() public {
+    MockRealTornadoPool other = _newPool(10 ether);
+    ForwarderFactory unapproved = new ForwarderFactory(address(bridge), ITornadoInstance(address(other)));
+
+    vm.expectRevert(
+      abi.encodeWithSelector(
+        TornadoEthBridgeL1.PoolNotApproved.selector, unapproved.computeForwarderAddress(COMMITMENT)
+      )
+    );
+    unapproved.withdrawAndBridge("", ROOT, NULLIFIER, COMMITMENT);
+  }
+
+  /* ------------------------------ Multiple pools ------------------------------ */
+
+  function _newPool(uint256 _denomination) internal returns (MockRealTornadoPool p) {
+    p = new MockRealTornadoPool(_denomination);
+    vm.deal(address(p), 10 * _denomination);
+    p.setKnownRoot(ROOT, true);
+  }
+
+  /// @dev One portal, one factory per ETH pool: every denomination mints the same tornadoETH.
+  function test_AllEthPoolsBridgeIntoOnePortal() public {
+    uint256[3] memory others = [uint256(0.1 ether), 10 ether, 100 ether];
+    ForwarderFactory[] memory factories = new ForwarderFactory[](4);
+    factories[0] = factory;
+    for (uint256 i = 0; i < others.length; i++) {
+      factories[i + 1] = new ForwarderFactory(address(bridge), ITornadoInstance(address(_newPool(others[i]))));
+      bridge.approveForwarderFactory(address(factories[i + 1]));
+    }
+
+    uint256 total;
+    for (uint256 i = 0; i < factories.length; i++) {
+      // Same nullifier on every pool is fine: depositIds are keyed on the (distinct) forwarders.
+      bytes32 commitment = bytes32(uint256(0xc0ffee00) + i);
+      uint256 amount = factories[i].DENOMINATION();
+      factories[i].withdrawAndBridge("", ROOT, NULLIFIER, commitment);
+      total += amount;
+
+      address forwarder = factories[i].computeForwarderAddress(commitment);
+      bytes32 depositId = _depositId(forwarder, NULLIFIER, amount);
+      assertTrue(bridge.consumedDepositIds(depositId));
+      (,, bytes32 content, bytes32 secretHash) = inbox.lastMessage();
+      assertEq(content, _claimContentHash(depositId, amount), "mint message carries the pool's amount");
+      assertEq(secretHash, commitment);
+    }
+    assertEq(total, 111.1 ether);
+    assertEq(bridge.totalLockedEth(), total);
+    assertEq(address(bridge).balance, total);
+  }
+
+  function test_RevertWhen_ForwarderOfOneFactoryClaimsAnother() public {
+    ForwarderFactory tens = new ForwarderFactory(address(bridge), ITornadoInstance(address(_newPool(10 ether))));
+    bridge.approveForwarderFactory(address(tens));
+
+    // A 1 ETH forwarder naming the 10 ETH factory fails the CREATE2 check (it would otherwise be
+    // credited 10 ETH of denomination for 1 ETH delivered; the value check also catches it).
+    LyingForwarder liar = new LyingForwarder(address(tens));
+    vm.deal(address(liar), DENOMINATION);
+    vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.PoolNotApproved.selector, address(liar)));
+    liar.attack{value: DENOMINATION}(bridge, NULLIFIER, COMMITMENT);
+  }
+
+  /// @dev Approving another factory must not strand a pending front-run recovery on an earlier one.
+  function test_ApprovingAnotherFactoryKeepsEarlierOnesLive() public {
+    _frontRunDirectlyToPool(COMMITMENT);
+    bridge.approveForwarderFactory(
+      address(new ForwarderFactory(address(bridge), ITornadoInstance(address(_newPool(10 ether)))))
+    );
+
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+    assertEq(bridge.totalLockedEth(), DENOMINATION);
   }
 
   /* ------------------------ Front-run recovery ------------------------ */

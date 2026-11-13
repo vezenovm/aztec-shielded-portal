@@ -26,8 +26,11 @@ interface IVerifier {
  * `yarn test:l1:fork`.
  */
 contract RealTornadoForkTest is Test {
-  // Canonical Tornado.Cash 1 ETH pool.
+  // Canonical Tornado.Cash ETH pools.
+  address internal constant TORNADO_01ETH = 0x12D66f87A04A9E220743712cE6d9bB1B5616B8Fc;
   address internal constant TORNADO_1ETH = 0x47CE0C6eD5B0Ce3d3A51fdb1C52DC66a7c3c2936;
+  address internal constant TORNADO_10ETH = 0x910Cbd523D972eb0a6f4cAe4618aD62622b39DbF;
+  address internal constant TORNADO_100ETH = 0xA160cdAB225685dA1d56aa342Ad8841c3b53f291;
 
   uint256 internal constant ROLLUP_VERSION = 42;
   bytes32 internal constant L2_TOKEN = bytes32(uint256(0x1234abcd));
@@ -62,7 +65,7 @@ contract RealTornadoForkTest is Test {
     bridge.initialize(address(registry), L2_TOKEN);
 
     factory = new ForwarderFactory(address(bridge), pool);
-    bridge.setForwarderFactory(address(factory));
+    bridge.approveForwarderFactory(address(factory));
 
     // Tier 2: bypass only zk proof VERIFICATION (an external call to the verifier contract). Root
     // membership is an INTERNAL call inside Tornado.withdraw and cannot be mocked, so the tests use a
@@ -137,6 +140,37 @@ contract RealTornadoForkTest is Test {
     factory.bridgeSpentWithdrawal("", root, nullifier, COMMITMENT);
     assertEq(bridge.totalLockedEth(), pool.denomination(), "stranded ETH bridged");
     assertTrue(bridge.consumedDepositIds(_depositId(forwarder, nullifier, pool.denomination())));
+  }
+
+  /// @dev One portal fed by every canonical ETH pool, so notes of all denominations mint the same
+  /// tornadoETH (and can be merged on Aztec).
+  function test_AllRealEthPoolsBridgeIntoOnePortal() public onlyFork {
+    address[4] memory pools = [TORNADO_01ETH, TORNADO_1ETH, TORNADO_10ETH, TORNADO_100ETH];
+    uint256[4] memory denominations = [uint256(0.1 ether), 1 ether, 10 ether, 100 ether];
+
+    uint256 total;
+    for (uint256 i = 0; i < pools.length; i++) {
+      ITornadoInstance p = ITornadoInstance(pools[i]);
+      assertEq(p.denomination(), denominations[i], "canonical instance denomination");
+      vm.mockCall(p.verifier(), abi.encodeWithSelector(IVerifier.verifyProof.selector), abi.encode(true));
+
+      ForwarderFactory f = factory;
+      if (pools[i] != TORNADO_1ETH) {
+        f = new ForwarderFactory(address(bridge), p);
+        bridge.approveForwarderFactory(address(f));
+      }
+
+      bytes32 commitment = bytes32(uint256(0xc0ffee00) + i);
+      bytes32 nullifier = _freshNullifier(100 + i);
+      f.withdrawAndBridge("", p.getLastRoot(), nullifier, commitment);
+      total += denominations[i];
+
+      address forwarder = f.computeForwarderAddress(commitment);
+      assertTrue(bridge.consumedDepositIds(_depositId(forwarder, nullifier, denominations[i])));
+      assertTrue(p.nullifierHashes(nullifier), "nullifier spent on the real pool");
+    }
+    assertEq(bridge.totalLockedEth(), total);
+    assertEq(address(bridge).balance, total);
   }
 
   function test_RevertWhen_RootUnknownOnRealPool() public onlyFork {
