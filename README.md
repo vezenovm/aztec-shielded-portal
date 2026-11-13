@@ -1,10 +1,14 @@
+> [!WARNING]
+> **This code has not been audited.** It is experimental research software, provided "as is",
+> without warranty of any kind (see [LICENSE](./LICENSE)). A bug in the L1 portal, the forwarder or
+> the Aztec contract can mint unbacked `tornadoETH` or lock or release ETH incorrectly. Do not use
+> it with real funds without your own independent review. See [SECURITY.md](./SECURITY.md).
+
 # aztec-shielded-portal
 
 Tornado Cash → Aztec bridge PoC. ETH withdrawn from a Tornado pool is locked in an L1 portal and
 minted on Aztec as private **`tornadoETH`**, 1:1 reserve-backed and redeemable back to L1.
-
-> **Unaudited research PoC.** Tornado provenance is public by design; Aztec ownership, balances and
-> transfers are private. See [SECURITY.md](./SECURITY.md).
+Tornado provenance is public by design; Aztec ownership, balances and transfers are private.
 
 ## Flow
 
