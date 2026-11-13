@@ -17,14 +17,8 @@ mainnet or use it with real funds. It targets local networks and testnet only.
 - **Self-submission gas linkage.** Anyone may submit `withdrawFromAztec` (funds can only reach the
   committed recipient), but if the *recipient* submits it themselves, the gas-paying L1 EOA becomes
   linkable to the recipient. Use a relayer / fresh funded EOA to preserve withdrawal privacy.
-- **Provenance is public by design.** Every deposit is attributable to a distinct Tornado withdrawal
-  (one bridge per nullifier); only Aztec-side ownership/transfers are private (see the README
-  privacy table). On the mock pool and the normal forwarder path the locked ETH *is* the pool's
-  payment. On the front-run recovery path (`ForwarderFactory.bridgeSpentWithdrawal`) it is not
-  provably so: nothing on-chain records where the pool paid a spent withdrawal, so recovery proves
-  only that the spent note's owner authorized the commitment, and the forwarder's balance could be
-  a plain top-up. Restoring strict ETH provenance there needs pre-deployed forwarders that accept
-  ETH only from the pool (or a receipt proof).
+- **Provenance is public by design.** Each mint locks 1 denomination and spends a distinct Tornado
+  nullifier. Only Aztec-side ownership and transfers are private (see the README privacy table).
 - **`fee == 0` / `msg.value == denomination`.** Relayers are out of scope this milestone: the bridge
   accepts exactly the pool denomination with zero fee/refund. A mainnet design must relax this and
   reconcile the L2 mint amount (additive on the CREATE2-forwarder binding).

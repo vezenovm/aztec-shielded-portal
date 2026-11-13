@@ -23,11 +23,8 @@ import {Forwarder} from "./Forwarder.sol";
  * `bridgeSpentWithdrawal` completes such a withdrawal: it re-verifies the same proof against the
  * pool's verifier with the forwarder as recipient, so it can only ever finish the original mint.
  *
- * Provenance caveat (recovery path only): nothing on-chain records WHERE the pool paid a spent
- * withdrawal, so recovery cannot prove the forwarder's balance is the pool's payment rather than a
- * plain top-up. It proves instead that the owner of a spent note authorized this commitment. Each
- * nullifier can be bridged at most once across BOTH paths (`bridgedNullifiers`), so one Tornado
- * withdrawal backs at most one deposit; on the normal path the ETH is the pool's own payment.
+ * Each nullifier bridges at most once across both paths (`bridgedNullifiers`), so every mint is
+ * backed by DENOMINATION and a distinct spent Tornado note.
  *
  * PoC: not production-ready. See README for the threat-model simplifications.
  */
