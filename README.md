@@ -9,34 +9,20 @@
 
 Tornado Cash → Aztec bridge PoC. ETH withdrawn from a Tornado pool is locked in an L1 portal and
 minted on Aztec as private **`tornadoETH`**, 1:1 reserve-backed and redeemable back to L1.
-Tornado provenance is public by design; Aztec ownership, balances and transfers are private.
+
+This extends Tornado's privacy set without needing a full L2 ecosystem: on Aztec a fixed-denomination
+withdrawal becomes private notes that can be split and redeemed in smaller amounts over time. That
+helps any Tornado user, even on their own (e.g. a 100 ETH depositor withdrawing small increments
+whenever they like).
 
 ## Flow
 
-```text
-Tornado withdrawal -> TornadoEthBridgeL1 (lock ETH)  -> Inbox.sendL2Message      L1, public
-                   -> claim_from_tornado_bridge      (private mint)              Aztec
-                   -> transfer_private                                           Aztec
-                   -> burn_for_l1_withdrawal         (private burn, L2->L1 msg)  Aztec
-                   -> withdrawFromAztec              (consume outbox, release)   L1
-```
+- **Deposit → mint.** A Tornado withdrawal into the portal locks the ETH and sends an L1→L2 message
+  committed to a hidden Aztec recipient, who claims it as private `tornadoETH`.
+- **Burn → redeem.** A private burn sends an L2→L1 message; once the epoch settles, anyone can relay
+  it and the portal releases the ETH to the L1 recipient named in the burn.
 
-**Deposit → mint.** The user picks a random `mint_secret` and passes one `bytes32` through the
-Tornado withdrawal:
-
-```text
-aztecMintCommitment = compute_secret_hash([poseidon2([aztec_recipient, mint_secret, amount])])
-```
-
-It rides in the L1→L2 message's `secretHash` slot; the content commits to `(depositId, amount)`.
-`claim_from_tornado_bridge` recomputes the preimage from `msg_sender`, so only the committed
-recipient can claim, and the message nullifier makes it single-use. L1 never sees the recipient.
-
-**Burn → redeem.** `burn_for_l1_withdrawal(recipient_l1, amount, nonce)` nullifies the burner's
-notes and emits an L2→L1 message over `(bridge, recipient_l1, amount, nonce)`, without the burner's
-identity. Once the epoch settles, anyone can call `withdrawFromAztec` with the outbox witness; funds
-only go to the committed recipient, and consuming the leaf prevents replay. The bridge has no
-`receive()`: pool withdrawals are the only ETH ingress.
+Contract-level details are in [docs/DESIGN.md](./docs/DESIGN.md).
 
 | Public (L1)                                  | Private (Aztec)                     |
 | -------------------------------------------- | ----------------------------------- |
