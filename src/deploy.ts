@@ -224,6 +224,29 @@ export async function waitForL1Success(
 }
 
 /**
+ * `deployL1Contract`, but fail loudly on a reverted deployment: the underlying helper returns the
+ * predicted address even when the creation tx reverted, so follow-up writes (e.g. funding a pool)
+ * would succeed against an address with no code.
+ */
+export async function deployL1ContractChecked(
+  client: L1Client,
+  abi: Abi,
+  bytecode: `0x${string}`,
+  args: readonly unknown[],
+): Promise<`0x${string}`> {
+  const { address, txHash } = await deployL1Contract(client, abi, bytecode, args);
+  if (txHash) {
+    await waitForL1Success(client, txHash);
+  }
+  const deployed = address.toString() as `0x${string}`;
+  const code = await client.getCode({ address: deployed });
+  if (!code || code === '0x') {
+    throw new Error(`L1 deployment left no code at ${deployed}`);
+  }
+  return deployed;
+}
+
+/**
  * Attach to an already-deployed tornadoETH from a fresh wallet: fetch the instance from the node
  * and register it with the artifact (a new PXE knows nothing about contracts it did not deploy).
  */
@@ -244,13 +267,11 @@ export async function loadTornadoEthToken(
 /* -------------------------------------------------------------------------- */
 
 export async function deployMockTornadoPool(client: L1Client, denomination: bigint): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, MockTornadoPoolAbi, MockTornadoPoolBytecode, [denomination]);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, MockTornadoPoolAbi, MockTornadoPoolBytecode, [denomination]);
 }
 
 export async function deployTornadoBridge(client: L1Client): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, TornadoEthBridgeL1Abi, TornadoEthBridgeL1Bytecode, []);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, TornadoEthBridgeL1Abi, TornadoEthBridgeL1Bytecode, []);
 }
 
 /** Fund the mock pool with ETH (stands in for Tornado deposits). */
@@ -644,15 +665,13 @@ export async function deployForwarderFactory(
   bridge: `0x${string}`,
   tornado: `0x${string}`,
 ): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, ForwarderFactoryAbi, ForwarderFactoryBytecode, [bridge, tornado]);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, ForwarderFactoryAbi, ForwarderFactoryBytecode, [bridge, tornado]);
 }
 
 export async function deployMockRealTornadoPool(client: L1Client, denomination: bigint): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, MockRealTornadoPoolAbi, MockRealTornadoPoolBytecode, [
+  return deployL1ContractChecked(client, MockRealTornadoPoolAbi, MockRealTornadoPoolBytecode, [
     denomination,
   ]);
-  return address.toString() as `0x${string}`;
 }
 
 /** Read a Tornado pool's `verifier()` (e.g. the real 1 ETH pool on a mainnet fork). */
@@ -681,13 +700,12 @@ export async function deployOwnTornadoPool(
     bytecode: string;
   };
   const operator = opts.operator ?? (client.account!.address as `0x${string}`);
-  const { address } = await deployL1Contract(client, artifact.abi, artifact.bytecode as `0x${string}`, [
+  return deployL1ContractChecked(client, artifact.abi, artifact.bytecode as `0x${string}`, [
     opts.verifier,
     opts.denomination ?? ONE_ETH,
     opts.merkleTreeHeight ?? 20,
     operator,
   ]);
-  return address.toString() as `0x${string}`;
 }
 
 /** Approve a ForwarderFactory as the real-Tornado ingress (owner-only). */
@@ -730,12 +748,92 @@ async function setMockRealPoolKnownRoot(
  */
 export async function withdrawViaForwarder(
   stack: Pick<BridgeStack, 'l1Client' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
-  payload: { proof: `0x${string}`; root: `0x${string}`; nullifierHash: `0x${string}`; commitment: Fr; mintSecret: Fr },
+  payload: ForwarderPayload,
+): Promise<TornadoDeposit> {
+  try {
+    return await sendForwarderTx(stack, 'withdrawAndBridge', payload);
+  } catch (err) {
+    // The proof is public once broadcast: a front-runner may have replayed it directly against the
+    // pool (nullifier spent, ETH at the undeployed forwarder), and anyone may already have finished
+    // the bridge. Recover rather than losing the mint secret with the thrown error.
+    const existing = await findForwarderDeposit(stack, payload);
+    if (existing) {
+      return existing;
+    }
+    try {
+      return await sendForwarderTx(stack, 'bridgeSpentWithdrawal', payload);
+    } catch (recoveryErr) {
+      const raced = await findForwarderDeposit(stack, payload);
+      if (raced) {
+        return raced;
+      }
+      throw new ForwarderWithdrawalError(
+        `forwarder withdrawal failed (${errorMessage(err)}) and recovery failed (${errorMessage(recoveryErr)})`,
+        payload,
+      );
+    }
+  }
+}
+
+export interface ForwarderPayload {
+  proof: `0x${string}`;
+  root: `0x${string}`;
+  nullifierHash: `0x${string}`;
+  commitment: Fr;
+  mintSecret: Fr;
+}
+
+/**
+ * A forwarder withdrawal that could not be completed or located. `recovery` holds everything needed
+ * to retry `ForwarderFactory.bridgeSpentWithdrawal` and later claim -- persist it, especially
+ * `mintSecret`: without it the eventual L1->L2 message can never be claimed.
+ */
+export class ForwarderWithdrawalError extends Error {
+  constructor(
+    message: string,
+    readonly recovery: ForwarderPayload,
+  ) {
+    super(message);
+    this.name = 'ForwarderWithdrawalError';
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message.split('\n')[0] : String(err);
+}
+
+function toForwarderDeposit(
+  stack: Pick<BridgeStack, 'denomination'>,
+  payload: ForwarderPayload,
+  args: { nullifierHash: `0x${string}`; depositId: `0x${string}`; messageKey: `0x${string}`; messageLeafIndex: bigint },
+): TornadoDeposit {
+  return {
+    mintSecret: payload.mintSecret,
+    commitment: payload.commitment,
+    nullifierHash: args.nullifierHash,
+    depositId: args.depositId,
+    messageHash: Fr.fromHexString(args.messageKey),
+    messageLeafIndex: args.messageLeafIndex,
+    amount: stack.denomination,
+  };
+}
+
+type DepositLogArgs = {
+  nullifierHash: `0x${string}`;
+  depositId: `0x${string}`;
+  messageKey: `0x${string}`;
+  messageLeafIndex: bigint;
+};
+
+async function sendForwarderTx(
+  stack: Pick<BridgeStack, 'l1Client' | 'denomination'> & { factory: `0x${string}` },
+  functionName: 'withdrawAndBridge' | 'bridgeSpentWithdrawal',
+  payload: ForwarderPayload,
 ): Promise<TornadoDeposit> {
   const hash = await stack.l1Client.writeContract({
     address: stack.factory,
     abi: ForwarderFactoryAbi,
-    functionName: 'withdrawAndBridge',
+    functionName,
     args: [payload.proof, payload.root, payload.nullifierHash, payload.commitment.toString()],
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
@@ -746,22 +844,43 @@ export async function withdrawViaForwarder(
     abi: TornadoEthBridgeL1Abi,
     logs: receipt.logs,
     eventName: 'TornadoBridgeDeposit',
-  }) as unknown as Array<{
-    args: { depositId: `0x${string}`; messageKey: `0x${string}`; messageLeafIndex: bigint };
-  }>;
+  }) as unknown as Array<{ args: DepositLogArgs }>;
   if (!log) {
     throw new Error('TornadoBridgeDeposit event not found in receipt');
   }
+  return toForwarderDeposit(stack, payload, log.args);
+}
 
-  return {
-    mintSecret: payload.mintSecret,
-    commitment: payload.commitment,
-    nullifierHash: payload.nullifierHash,
-    depositId: log.args.depositId,
-    messageHash: Fr.fromHexString(log.args.messageKey),
-    messageLeafIndex: log.args.messageLeafIndex,
-    amount: stack.denomination,
-  };
+/**
+ * Find a deposit the portal already registered for this commitment's forwarder (someone else may
+ * have completed the bridge). Prefers the deposit for our nullifier; any deposit through this
+ * forwarder mints to our commitment, so the latest one is the fallback.
+ */
+async function findForwarderDeposit(
+  stack: Pick<BridgeStack, 'l1Client' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
+  payload: ForwarderPayload,
+  lookbackBlocks = 10_000n,
+): Promise<TornadoDeposit | undefined> {
+  const forwarder = (await stack.l1Client.readContract({
+    address: stack.factory,
+    abi: ForwarderFactoryAbi,
+    functionName: 'computeForwarderAddress',
+    args: [payload.commitment.toString()],
+  })) as `0x${string}`;
+  const latest = await stack.l1Client.getBlockNumber();
+  const logs = (await stack.l1Client.getContractEvents({
+    address: stack.bridge,
+    abi: TornadoEthBridgeL1Abi,
+    eventName: 'TornadoBridgeDeposit',
+    args: { pool: forwarder },
+    fromBlock: latest > lookbackBlocks ? latest - lookbackBlocks : 0n,
+    toBlock: latest,
+  })) as unknown as Array<{ args: DepositLogArgs }>;
+  if (logs.length === 0) {
+    return undefined;
+  }
+  const ours = logs.find(l => l.args.nullifierHash.toLowerCase() === payload.nullifierHash.toLowerCase());
+  return toForwarderDeposit(stack, payload, (ours ?? logs[logs.length - 1]).args);
 }
 
 /**

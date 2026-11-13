@@ -153,9 +153,14 @@ contract ForwarderTest is Test {
   function test_RevertWhen_NullifierReusedAtPool() public {
     factory.withdrawAndBridge("", ROOT, NULLIFIER, COMMITMENT);
 
-    // Same nullifier, different commitment: the real pool's nullifier set rejects the replay.
-    vm.expectRevert(MockRealTornadoPool.NoteAlreadySpent.selector);
+    // Same nullifier, different commitment: the factory's per-nullifier guard rejects it first...
+    vm.expectRevert(abi.encodeWithSelector(ForwarderFactory.NullifierAlreadyBridged.selector, NULLIFIER));
     factory.withdrawAndBridge("", ROOT, NULLIFIER, bytes32(uint256(0xc0ffef)));
+
+    // ...and the pool's own nullifier set rejects a direct replay.
+    address other = factory.computeForwarderAddress(bytes32(uint256(0xc0ffef)));
+    vm.expectRevert(MockRealTornadoPool.NoteAlreadySpent.selector);
+    pool.withdraw("", ROOT, NULLIFIER, payable(other), payable(address(0)), 0, 0);
   }
 
   function test_RevertWhen_RootUnknown() public {
@@ -251,19 +256,28 @@ contract ForwarderTest is Test {
 
     // Topping the forwarder up with plain ETH cannot mint a second deposit for the same nullifier.
     vm.deal(forwarder, DENOMINATION);
-    bytes32 depositId = _depositId(forwarder, NULLIFIER, DENOMINATION);
-    vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.DepositAlreadyRegistered.selector, depositId));
+    vm.expectRevert(abi.encodeWithSelector(ForwarderFactory.NullifierAlreadyBridged.selector, NULLIFIER));
     factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
   }
 
   function test_RevertWhen_RecoveryAfterNormalBridge() public {
     factory.withdrawAndBridge("", ROOT, NULLIFIER, COMMITMENT);
-    address forwarder = factory.computeForwarderAddress(COMMITMENT);
 
-    vm.deal(forwarder, DENOMINATION);
-    bytes32 depositId = _depositId(forwarder, NULLIFIER, DENOMINATION);
-    vm.expectRevert(abi.encodeWithSelector(TornadoEthBridgeL1.DepositAlreadyRegistered.selector, depositId));
+    vm.deal(factory.computeForwarderAddress(COMMITMENT), DENOMINATION);
+    vm.expectRevert(abi.encodeWithSelector(ForwarderFactory.NullifierAlreadyBridged.selector, NULLIFIER));
     factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+  }
+
+  /// @dev One spent note must not authorize many plain-ETH-backed deposits through fresh forwarders.
+  function test_RevertWhen_SpentNullifierReusedForAnotherForwarder() public {
+    _frontRunDirectlyToPool(COMMITMENT);
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, COMMITMENT);
+
+    bytes32 freshCommitment = bytes32(uint256(0xf00d));
+    vm.deal(factory.computeForwarderAddress(freshCommitment), DENOMINATION);
+    vm.expectRevert(abi.encodeWithSelector(ForwarderFactory.NullifierAlreadyBridged.selector, NULLIFIER));
+    factory.bridgeSpentWithdrawal("", ROOT, NULLIFIER, freshCommitment);
+    assertEq(bridge.totalLockedEth(), DENOMINATION, "still exactly one deposit for the note");
   }
 
   /* ------------------------------ Coexistence ------------------------------ */

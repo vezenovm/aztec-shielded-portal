@@ -18,7 +18,7 @@
     "test:l1:fork": "aztec-forge test --root contracts/l1 --match-path 'test/fork/*.t.sol' -vv",
     "test:sdk": "node --import tsx --test test/sdk-config.test.ts test/real-tornado.test.ts",
     "test:aztec-unit": "cd contracts/aztec && aztec test",
-    "test:aztec": "node --import tsx --test test/aztec.test.ts",
+    "test:aztec": "node --import tsx --test --test-concurrency=1 test/aztec.test.ts test/forwarder-recovery.test.ts",
     "test:e2e": "node --import tsx --test test/e2e.test.ts",
     "test:fork": "node --import tsx --test test/fork/real-tornado.fork.test.ts",
     "rehearsal:real-tornado": "tsx scripts/real-tornado-rehearsal.ts",

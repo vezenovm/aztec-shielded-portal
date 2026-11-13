@@ -24,7 +24,6 @@
  * own `withdraw` command output.
  */
 import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
-import { deployL1Contract } from '@aztec-labs/ethereum/deploy-l1-contract';
 import { EthAddress } from '@aztec-labs/foundation/eth-address';
 import { type Abi, parseAbi } from 'viem';
 
@@ -45,6 +44,7 @@ import {
   TEST_MNEMONIC,
   withdrawFromRealTornadoToBridge,
   type L1Client,
+  deployL1ContractChecked,
   waitForL1Success,
 } from '../src/index.js';
 import { createTornadoNoteViaCli, TORNADO_1ETH_MAINNET } from '../src/real-tornado.js';
@@ -64,8 +64,7 @@ async function deployMock(
   json: { abi: unknown; bytecode: { object: string } },
   args: unknown[],
 ): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, json.abi as Abi, json.bytecode.object as `0x${string}`, args);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, json.abi as Abi, json.bytecode.object as `0x${string}`, args);
 }
 
 export interface RehearsalResult {

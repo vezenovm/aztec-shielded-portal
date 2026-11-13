@@ -23,6 +23,12 @@ import {Forwarder} from "./Forwarder.sol";
  * `bridgeSpentWithdrawal` completes such a withdrawal: it re-verifies the same proof against the
  * pool's verifier with the forwarder as recipient, so it can only ever finish the original mint.
  *
+ * Provenance caveat (recovery path only): nothing on-chain records WHERE the pool paid a spent
+ * withdrawal, so recovery cannot prove the forwarder's balance is the pool's payment rather than a
+ * plain top-up. It proves instead that the owner of a spent note authorized this commitment. Each
+ * nullifier can be bridged at most once across BOTH paths (`bridgedNullifiers`), so one Tornado
+ * withdrawal backs at most one deposit; on the normal path the ETH is the pool's own payment.
+ *
  * PoC: not production-ready. See README for the threat-model simplifications.
  */
 contract ForwarderFactory {
@@ -42,6 +48,10 @@ contract ForwarderFactory {
   error ForwarderAddressMismatch(address deployed, address expected);
   error WithdrawalNotSpent(bytes32 nullifierHash);
   error InvalidWithdrawProof();
+  error NullifierAlreadyBridged(bytes32 nullifierHash);
+
+  /// @notice Tornado nullifiers already bridged by either path (one deposit per Tornado withdrawal).
+  mapping(bytes32 nullifierHash => bool bridged) public bridgedNullifiers;
 
   constructor(address _portal, ITornadoInstance _tornado) {
     PORTAL = _portal;
@@ -68,6 +78,7 @@ contract ForwarderFactory {
     bytes32 _aztecMintCommitment
   ) external {
     require(_aztecMintCommitment != 0, EmptyCommitment());
+    _markBridged(_nullifierHash);
 
     Forwarder forwarder = _deployForwarder(_aztecMintCommitment);
 
@@ -101,6 +112,7 @@ contract ForwarderFactory {
   ) external {
     require(_aztecMintCommitment != 0, EmptyCommitment());
     require(TORNADO.nullifierHashes(_nullifierHash), WithdrawalNotSpent(_nullifierHash));
+    _markBridged(_nullifierHash);
 
     address forwarderAddress = computeForwarderAddress(_aztecMintCommitment);
     uint256[6] memory input =
@@ -126,6 +138,11 @@ contract ForwarderFactory {
         )
       )
     );
+  }
+
+  function _markBridged(bytes32 _nullifierHash) internal {
+    require(!bridgedNullifiers[_nullifierHash], NullifierAlreadyBridged(_nullifierHash));
+    bridgedNullifiers[_nullifierHash] = true;
   }
 
   function _deployForwarder(bytes32 _commitment) internal returns (Forwarder) {
