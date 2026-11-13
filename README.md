@@ -140,7 +140,8 @@ MAINNET_RPC_URL=https://eth.drpc.org yarn rehearsal:real-tornado
 ```
 
 `--real-pool` uses the canonical pool instead, rebuilding its tree from tornado-cli's event cache plus
-`getLogs`; that needs an RPC serving wide `getLogs` ranges. `--l1-only` stops at the portal.
+`getLogs`; that needs an RPC serving wide `getLogs` ranges (e.g. Alchemy with
+`LOGS_MAX_RANGE=1000000`). `--l1-only` stops at the portal.
 
 ## Security properties
 
