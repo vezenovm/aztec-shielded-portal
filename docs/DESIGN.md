@@ -1,29 +1,31 @@
 # Design notes
 
-Background for `README.md`: where the implementation departs from the original PoC spec, and how to
-add a second origin bridge.
+## Flow
 
-## Deviations from the spec
+```text
+Tornado withdrawal -> TornadoEthBridgeL1 (lock ETH)  -> Inbox.sendL2Message      L1, public
+                   -> claim_from_tornado_bridge      (private mint)              Aztec
+                   -> transfer_private                                           Aztec
+                   -> burn_for_l1_withdrawal         (private burn, L2->L1 msg)  Aztec
+                   -> withdrawFromAztec              (consume outbox, release)   L1
+```
 
-Protocol reality required a few interface adjustments; the substance is unchanged:
+**Deposit → mint.** The user picks a random `mint_secret` and passes one `bytes32` through the
+Tornado withdrawal:
 
-1. `claim_from_tornado_bridge` gains a `message_leaf_index: Field` parameter — consuming
-   an L1→L2 message requires its inbox leaf index (returned by `sendL2Message`, surfaced
-   in the `TornadoBridgeDeposit` event).
-2. `withdrawFromAztec` takes the real outbox witness `(nonce, epoch,
-   numCheckpointsInEpoch, leafIndex, path)` instead of a bare `burnMessageHash`; the
-   message (and its hash, emitted in `AztecRedemption`) is reconstructed in-contract.
-3. `depositId` uses `Hash.sha256ToField` rather than raw `keccak256` so the id fits in a
-   Noir field and can be recomputed identically inside the claim circuit.
-4. `aztecMintCommitment = compute_secret_hash([poseidon2([recipient, mint_secret,
-   amount])])` rides in the message's `secretHash` slot (the protocol's native private-
-   consumption mechanism); the content carries `(depositId, amount)`. The message leaf
-   commits to all of it.
-5. The spec's L1 unit tests live in Foundry (`contracts/l1/test`), not `l1.test.ts`.
-   Aztec claim-path cases live in `test/aztec.test.ts` against the local network — the
-   TXE cannot inject L1→L2 messages at the pinned version.
-6. `TornadoBridgeDeposit` additionally emits `(messageKey, messageLeafIndex)` so clients
-   don't need to recompute them.
+```text
+aztecMintCommitment = compute_secret_hash([poseidon2([aztec_recipient, mint_secret, amount])])
+```
+
+It rides in the L1→L2 message's `secretHash` slot; the content commits to `(depositId, amount)`.
+`claim_from_tornado_bridge` recomputes the preimage from `msg_sender`, so only the committed
+recipient can claim, and the message nullifier makes it single-use. L1 never sees the recipient.
+
+**Burn → redeem.** `burn_for_l1_withdrawal(recipient_l1, amount, nonce)` nullifies the burner's
+notes and emits an L2→L1 message over `(bridge, recipient_l1, amount, nonce)`, without the burner's
+identity. Once the epoch settles, anyone can call `withdrawFromAztec` with the outbox witness; funds
+only go to the committed recipient, and consuming the leaf prevents replay. The bridge has no
+`receive()`: pool withdrawals are the only ETH ingress.
 
 ## Adding another bridge
 

@@ -10,10 +10,10 @@
 Tornado Cash → Aztec bridge PoC. ETH withdrawn from a Tornado pool is locked in an L1 portal and
 minted on Aztec as private **`tornadoETH`**, 1:1 reserve-backed and redeemable back to L1.
 
-This extends Tornado's privacy set without needing a full L2 ecosystem: on Aztec a fixed-denomination
-withdrawal becomes private notes that can be split and redeemed in smaller amounts over time. That
-helps any Tornado user, even on their own (e.g. a 100 ETH depositor withdrawing small increments
-whenever they like).
+On Aztec, a fixed-denomination withdrawal becomes private notes that can be split and redeemed in
+any amount, to any L1 address, over time (e.g. a 100 ETH note redeemed in small increments).
+Tornado still hides which deposit funded the mint; how well redemptions hide from each other
+depends on how many other users hold `tornadoETH`.
 
 ## Flow
 
@@ -142,4 +142,4 @@ MAINNET_RPC_URL=https://eth.drpc.org yarn rehearsal:real-tornado
 - The Aztec recipient never appears on L1.
 - CEI + reentrancy guard on `withdrawFromAztec`; reserves can't go negative; no plain ETH ingress.
 
-Spec deviations and how to add another origin bridge: [docs/DESIGN.md](./docs/DESIGN.md).
+Design details and how to add another origin bridge: [docs/DESIGN.md](./docs/DESIGN.md).
