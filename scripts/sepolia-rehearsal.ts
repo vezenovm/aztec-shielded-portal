@@ -14,6 +14,7 @@ import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
 import { parseAbi } from 'viem';
 
 import {
+  approveForwarderFactory,
   type AztecConnection,
   balanceOfPrivate,
   burnForL1Withdrawal,
@@ -29,7 +30,6 @@ import {
   makeMessageConsumable,
   ONE_ETH,
   PXE_SYNC_CHAIN_TIP,
-  setForwarderFactory,
   rebuildPoolHistory,
   withdrawFromRealTornadoToBridge,
   withdrawFromAztecOnL1,
@@ -77,7 +77,7 @@ export async function runSepoliaRehearsal(): Promise<{ lockedEthAfter: bigint }>
   // 2. Deploy + wire our bridge stack against the existing Sepolia pool (network-agnostic helpers).
   const bridge = await deployTornadoBridge(l1Client);
   const factory = await deployForwarderFactory(l1Client, bridge, pool);
-  await setForwarderFactory(l1Client, bridge, factory);
+  await approveForwarderFactory(l1Client, bridge, factory);
   const token = await deployTornadoEthToken(conn, alice, bridge);
   const { registryAddress } = await conn.node.getL1ContractAddresses();
   await initializeBridge(l1Client, bridge, registryAddress, token.address);

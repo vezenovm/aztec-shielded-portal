@@ -10,8 +10,9 @@
 Tornado Cash → Aztec bridge PoC. ETH withdrawn from a Tornado pool is locked in an L1 portal and
 minted on Aztec as private **`tornadoETH`**, 1:1 reserve-backed and redeemable back to L1.
 
-On Aztec, a fixed-denomination withdrawal becomes private notes that can be split and redeemed in
-any amount, to any L1 address, over time (e.g. a 100 ETH note redeemed in small increments).
+On Aztec, withdrawals from any Tornado ETH pool (0.1, 1, 10, 100) become one private balance that
+can be merged, split and redeemed in any amount, to any L1 address, over time (e.g. a 100 ETH note
+redeemed in small increments, or several small notes redeemed as one).
 Tornado still hides which deposit funded the mint; how well redemptions hide from each other
 depends on how many other users hold `tornadoETH`.
 
@@ -111,6 +112,9 @@ recipient, which invalidates the proof. If someone replays the proof directly ag
 ETH lands at the undeployed forwarder; anyone can then call `ForwarderFactory.bridgeSpentWithdrawal`
 with the same proof, which re-verifies it against the pool's verifier and finishes the original
 mint (the SDK does this automatically). Each Tornado nullifier bridges at most once.
+
+Each ETH pool gets its own `ForwarderFactory`, and the portal approves one per pool
+(`approveForwarderFactory`), so all four pools mint the same `tornadoETH`.
 
 Proofs come from Tornado's own circom1/websnark toolchain and proving key, in the isolated, opt-in
 `prover/` package (see [SECURITY.md](./SECURITY.md)).

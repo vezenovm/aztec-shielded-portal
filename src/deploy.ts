@@ -389,14 +389,14 @@ export async function setupBridgeStack(
   if (opts.existingPool) {
     pool = opts.existingPool;
     factory = await deployForwarderFactory(l1Client, bridge, pool);
-    await setForwarderFactory(l1Client, bridge, factory);
+    await approveForwarderFactory(l1Client, bridge, factory);
   } else if (opts.useRealTornado) {
     pool = await deployMockRealTornadoPool(l1Client, denomination);
     await fundPool(l1Client, pool, opts.poolLiquidity ?? 10n * denomination);
     mockKnownRoot = MOCK_REAL_KNOWN_ROOT;
     await setMockRealPoolKnownRoot(l1Client, pool, mockKnownRoot);
     factory = await deployForwarderFactory(l1Client, bridge, pool);
-    await setForwarderFactory(l1Client, bridge, factory);
+    await approveForwarderFactory(l1Client, bridge, factory);
   } else {
     pool = await deployMockTornadoPool(l1Client, denomination);
     await fundPool(l1Client, pool, opts.poolLiquidity ?? 10n * denomination);
@@ -751,8 +751,8 @@ export async function deployOwnTornadoPool(
   ]);
 }
 
-/** Approve a ForwarderFactory as the real-Tornado ingress (owner-only). */
-export async function setForwarderFactory(
+/** Approve a ForwarderFactory as real-Tornado ingress for its pool (owner-only; one per pool). */
+export async function approveForwarderFactory(
   client: L1Client,
   bridge: `0x${string}`,
   factory: `0x${string}`,
@@ -760,7 +760,7 @@ export async function setForwarderFactory(
   const hash = await client.writeContract({
     address: bridge,
     abi: TornadoEthBridgeL1Abi,
-    functionName: 'setForwarderFactory',
+    functionName: 'approveForwarderFactory',
     args: [factory],
     account: client.account!,
     chain: client.chain,
