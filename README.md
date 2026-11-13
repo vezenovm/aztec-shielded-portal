@@ -135,7 +135,7 @@ Hasher and pointed at the canonical Verifier), deposits, proves to our forwarder
 network's L1 contracts on the same fork, so claim → burn → redeem settle against the same L1:
 
 ```bash
-yarn prover:install        # npm ci --ignore-scripts in prover/ + sha256-checked circuit files
+yarn prover:install
 MAINNET_RPC_URL=https://eth.drpc.org yarn rehearsal:real-tornado
 ```
 

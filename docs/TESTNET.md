@@ -46,12 +46,3 @@ All three live in `scripts/sepolia-rehearsal.ts`:
    epochs for real. `getBurnWitness` already polls `computeL2ToL1MembershipWitness` (its
    `advanceL2Blocks` nudge is harmless on testnet) — it just needs a **generous timeout** (the script
    passes `1800s`; real settlement can take minutes).
-
-## What this proves
-
-A real circom1/websnark Tornado proof, bound to our CREATE2 forwarder, accepted by a **real
-(self-deployed) Tornado verifier on a public testnet**, driving the complete
-withdraw → claim → transfer → burn → redeem path across Sepolia and Aztec testnet with real proving
-and real epoch settlement — the live end-to-end rung above the local sandbox and the mainnet-fork
-rehearsal (`scripts/real-tornado-rehearsal.ts`), which already checks the proof against the real
-mainnet verifier.

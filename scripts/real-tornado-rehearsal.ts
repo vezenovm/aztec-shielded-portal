@@ -1,19 +1,11 @@
 /**
- * Real-Tornado rehearsal on a mainnet fork: a Groth16 proof from Tornado's own toolchain and proving
- * key, checked by the real on-chain verifier, driving the whole bridge round trip:
- *
- *   deposit into a Tornado pool -> rebuild its tree -> prove to our forwarder
- *   -> ForwarderFactory.withdrawAndBridge -> portal -> L1->L2 message -> private mint on Aztec
- *   -> burn -> L2->L1 message -> redeem on L1
- *
- * The Aztec local network deploys its L1 contracts onto the same fork, so both halves share one L1.
- *
- * The pool defaults to our own ETHTornado: the canonical 1 ETH pool's exact code, Hasher and real
- * Verifier, with our deposit as its only leaf, so no history is needed.
+ * Real-Tornado rehearsal on a mainnet fork (README "Real Tornado (Classic)", tier 3). The pool
+ * defaults to our own ETHTornado: the canonical 1 ETH pool's exact code, Hasher and real Verifier,
+ * with our deposit as its only leaf, so no history is needed.
  *
  * Flags:
  *   --real-pool  use the canonical 1 ETH pool instead; rebuilding its ~12M-block log tail needs an RPC
- *                that serves wide eth_getLogs ranges (free public tiers cap them at ~100 blocks)
+ *                that serves wide eth_getLogs ranges (set LOGS_MAX_RANGE, e.g. 1000000 on Alchemy)
  *   --l1-only    stop after the portal locks the ETH; Aztec messaging is mocked, no local network
  *
  * Env: MAINNET_RPC_URL (starts the fork + local network), or L1_RPC_URL [+ AZTEC_NODE_URL] to attach
@@ -137,7 +129,6 @@ export async function runRealTornadoRehearsal(
     await assertAnvilFork(client);
     const forkBlock = network?.forkBlock ?? (await client.getBlockNumber());
 
-    // 1. The pool: our own copy of the 1 ETH instance pointed at its verifier, or the canonical one.
     let pool: `0x${string}` = TORNADO_1ETH_MAINNET;
     let poolDeployBlock: bigint | undefined;
     if (!opts.realPool) {
@@ -145,13 +136,11 @@ export async function runRealTornadoRehearsal(
       poolDeployBlock = await client.getBlockNumber();
     }
 
-    // 2. Portal stack against that pool.
     console.log(`Deploying the portal stack against pool ${pool}...`);
     const full = opts.l1Only ? undefined : await setupBridgeStack({ existingPool: pool, l1, aztecNodeUrl });
     const stack = full ? { ...full, factory: full.factory! } : await setupL1OnlyStack(client, pool);
     const alice = full ? full.accounts[0] : await AztecAddress.random();
 
-    // 3. Deposit a fresh note, then rebuild the pool's tree as of that block.
     const { note, commitment } = createTornadoNote();
     const depositReceipt = await waitForL1Success(
       client,
@@ -176,12 +165,12 @@ export async function runRealTornadoRehearsal(
         ? createPublicClient({ transport: http(process.env.MAINNET_RPC_URL) })
         : undefined,
       forkBlock,
+      maxRange: process.env.LOGS_MAX_RANGE ? BigInt(process.env.LOGS_MAX_RANGE) : undefined,
       onProgress: logProgress(),
     });
     assert(history.leaves.at(-1) === commitment.toLowerCase(), 'our deposit is the last leaf');
     console.log(`${history.leaves.length} leaves, root ${history.root}`);
 
-    // 4. Prove to the forwarder; the real verifier must accept it, and reject it for any other recipient.
     console.log('Proving (circom1/websnark) and checking against the real verifier...');
     const withdrawal = await prepareRealTornadoWithdrawal(stack, alice, note, history);
     const tampered = [...withdrawal.proof.args] as typeof withdrawal.proof.args;
@@ -191,7 +180,6 @@ export async function runRealTornadoRehearsal(
       'the verifier must reject the proof for a different recipient',
     );
 
-    // 5. Real pool withdrawal -> forwarder -> portal.
     const deposit = await withdrawViaForwarder(stack, withdrawal.payload);
     assert((await getTotalLockedEth(client, stack.bridge)) === ONE_ETH, 'portal locked the denomination');
     assert(
@@ -217,7 +205,6 @@ export async function runRealTornadoRehearsal(
       return result;
     }
 
-    // 6. Aztec half: claim the private mint, burn all of it, redeem on L1.
     console.log('Claiming on Aztec...');
     await makeMessageConsumable(full, deposit, alice);
     await claimTornadoEth(full.token, alice, deposit);

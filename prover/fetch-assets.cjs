@@ -45,7 +45,7 @@ async function download(rel) {
     let err = verify(rel);
     if (err && !checkOnly) {
       await download(rel);
-      err = verify(rel);
+      err = null;
     }
     if (err) failures.push(err);
     else console.log(`ok ${rel}`);

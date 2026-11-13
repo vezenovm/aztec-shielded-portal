@@ -6,11 +6,7 @@
  * account, fees, real epoch-settlement waiting) into clearly-marked seams. The first live run wires
  * `registerTestnetAccount` and tunes timeouts -- see docs/TESTNET.md.
  *
- * Prerequisites (see docs/TESTNET.md):
- *   - A tornado-core pool deployed on Sepolia (use tornado-core's own migrations) -> SEPOLIA_TORNADO_POOL.
- *   - `yarn prover:install` for proving.
- *   - Sepolia: L1_RPC_URL, L1_CHAIN_ID=11155111, L1_PRIVATE_KEY (funded).
- *   - Aztec testnet: AZTEC_NODE_URL, plus a funded account (faucet / fee juice / sponsored FPC).
+ * Prerequisites: docs/TESTNET.md#prerequisites.
  */
 import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
 import { createAztecNodeClient } from '@aztec-labs/aztec.js/node';

@@ -38,7 +38,6 @@ function toHex(number, length = 32) {
   return '0x' + str.padStart(length * 2, '0');
 }
 
-// commitment = pedersen(nullifier ++ secret), nullifierHash = pedersen(nullifier), as in tornado-cli.
 function createDeposit({ nullifier, secret }) {
   const preimage = Buffer.concat([nullifier.leInt2Buff(31), secret.leInt2Buff(31)]);
   return {

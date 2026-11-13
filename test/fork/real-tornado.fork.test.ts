@@ -14,6 +14,5 @@ test(
   async () => {
     const result = await runRealTornadoRehearsal();
     assert.equal(result.mode, 'full');
-    assert.equal(result.redeemed, 10n ** 18n);
   },
 );

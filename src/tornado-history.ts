@@ -1,10 +1,6 @@
 /**
  * Rebuild a Tornado pool's ordered commitment list (the Merkle leaves a withdrawal proof is built
  * over) from the pinned tornado-cli deposit cache plus `Deposit` logs for the blocks after it.
- *
- * The result is checked against the pool itself: leaves must be contiguous from index 0, their count
- * must equal `nextIndex()` and the root to prove against is `getLastRoot()`, both read at the same
- * block. The prover then refuses to run unless its rebuilt root equals that root.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -150,11 +146,12 @@ export async function rebuildPoolHistory(opts: {
   fromBlock?: bigint;
   upstream?: LogsClient;
   forkBlock?: bigint;
+  maxRange?: bigint;
   onProgress?: (block: bigint) => void;
 }): Promise<PoolHistory> {
   const cache = (opts.cache ?? []).filter(e => BigInt(e.blockNumber) <= opts.blockNumber);
   const start = cache.length ? BigInt(cache[cache.length - 1].blockNumber) : (opts.fromBlock ?? 0n);
-  const fetchOpts = { onProgress: opts.onProgress };
+  const fetchOpts = { maxRange: opts.maxRange, onProgress: opts.onProgress };
   let tail: DepositEvent[];
   if (opts.upstream && opts.forkBlock !== undefined && start <= opts.forkBlock) {
     const split = opts.forkBlock < opts.blockNumber ? opts.forkBlock : opts.blockNumber;
