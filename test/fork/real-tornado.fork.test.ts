@@ -1,20 +1,19 @@
 /**
- * Real-Tornado fork rehearsal (env-gated): runs the real-proof rehearsal and asserts the bridge
- * locked the denomination. Skips unless a mainnet fork + a tornado-cli checkout are configured, so
- * the default `yarn test:*` stays offline. See scripts/real-tornado-rehearsal.ts for prerequisites.
+ * Real-Tornado fork rehearsal (opt-in): `RUN_REAL_TORNADO=1` plus MAINNET_RPC_URL (or L1_RPC_URL +
+ * AZTEC_NODE_URL for a running fork). Once enabled, missing prerequisites fail rather than skip.
+ * See scripts/real-tornado-rehearsal.ts.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { runRealTornadoRehearsal } from '../../scripts/real-tornado-rehearsal.js';
 
-const enabled = Boolean(process.env.TORNADO_CLI_DIR) && Boolean(process.env.L1_RPC_URL);
-
 test(
-  'a real Tornado proof is accepted by the real verifier and bridges the denomination',
-  { skip: enabled ? false : 'set TORNADO_CLI_DIR + L1_RPC_URL (mainnet fork) to run' },
+  'a real Tornado proof is accepted by the real verifier and the bridge round trip settles on a mainnet fork',
+  { skip: process.env.RUN_REAL_TORNADO === '1' ? false : 'set RUN_REAL_TORNADO=1 (see the rehearsal script)', timeout: 3_600_000 },
   async () => {
-    const { lockedEth } = await runRealTornadoRehearsal();
-    assert.equal(lockedEth, 10n ** 18n);
+    const result = await runRealTornadoRehearsal();
+    assert.equal(result.mode, 'full');
+    assert.equal(result.redeemed, 10n ** 18n);
   },
 );

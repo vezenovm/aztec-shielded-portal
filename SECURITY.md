@@ -26,13 +26,18 @@ mainnet or use it with real funds. It targets local networks and testnet only.
 
 ## Real-Tornado integration
 
-The real-Tornado proof path delegates to a **caller-supplied** `tornado-cli` checkout
-(`$TORNADO_CLI_DIR`); **nothing from Tornado Cash is vendored in this repository.** Generating a real
-proof requires installing tornado-cli's old, third-party (circom1/websnark) toolchain and is the
-**operator's deliberate step** — it is **never run in CI**.
+Real proofs need Tornado's old, third-party circom1/websnark toolchain. It lives in the isolated
+`prover/` package and is installed only by `yarn prover:install`, **never in CI** and never by the root
+install:
 
-- The optional mainnet-acceptance rehearsal (`scripts/real-tornado-rehearsal.ts`) runs **only on a
-  local anvil mainnet fork, with no real funds**, and is env-gated (`TORNADO_CLI_DIR` + `L1_RPC_URL`).
+- Dependencies are tornado-cli's own pins (git commits of the `tornadocash/*` forks), locked in
+  `prover/package-lock.json` and installed with `npm ci --ignore-scripts`. They still pull in
+  circomlib's transitive `web3` (only its `web3-utils` hashing is used).
+- The circuit, proving key, `ETHTornado` artifact and deposit-event cache are downloaded from
+  tornado-cli at a pinned commit and checked against `prover/assets.json` (size + sha256). They are
+  not committed.
+- The rehearsal (`scripts/real-tornado-rehearsal.ts`) refuses to run unless its L1 is an Anvil
+  mainnet fork, so it never spends real funds.
 - Interacting with Tornado Cash contracts/tooling may carry legal/compliance considerations (e.g.
   OFAC); operators are responsible for compliance in their own jurisdiction. The posture here —
   external, opt-in, nothing vendored, fork-only — is a conservative engineering choice and is **not

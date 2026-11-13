@@ -17,7 +17,7 @@ interface IVerifier {
 /**
  * @title RealTornadoForkTest (Tier 2)
  * @notice Drives our {ForwarderFactory}/portal against the REAL deployed 1 ETH Tornado pool bytecode
- * on a mainnet fork, with the pool's verifier (and root membership) mocked to bypass proof
+ * on a mainnet fork, with the pool's verifier mocked to bypass proof
  * generation. This proves the ENTIRE integration surface -- the real `withdraw` control flow, the
  * plain-ETH push into our forwarder, denomination, nullifier accounting on the real contract, the
  * forwarder->portal handoff, depositId derivation and the L1->L2 message -- EXCEPT proof validity

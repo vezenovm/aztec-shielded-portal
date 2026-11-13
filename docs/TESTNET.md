@@ -14,20 +14,19 @@ and tunes timeouts.
 1. **A tornado-core pool on Sepolia.** Deploy it with **tornado-core's own migrations** — do *not*
    re-implement the deploy. Its migrations correctly deploy the MiMC Hasher (via circomlib
    `createCode`), the Verifier (from the trusted setup), and `ETHTornado(verifier, hasher,
-   denomination, height)` at the right solc. Record the pool address → `SEPOLIA_TORNADO_POOL`.
+   denomination, height)` at the right solc. Record the pool address → `SEPOLIA_TORNADO_POOL` and
+   its deployment block → `SEPOLIA_TORNADO_POOL_DEPLOY_BLOCK`.
    (Unlike the mainnet fork, Sepolia has no canonical Verifier/Hasher on-chain, so you deploy your
    own — hence tornado-core's migrations rather than this repo's fork-only `deployOwnTornadoPool`.)
-2. **A `tornado-cli` checkout** for proving (operator's consented step; untrusted toolchain — see
-   SECURITY.md): `git clone https://github.com/tornadocash/tornado-cli && (cd tornado-cli && npm install)`
-   → `TORNADO_CLI_DIR`.
+2. **The prover**: `yarn prover:install` (isolated legacy toolchain; see SECURITY.md).
 3. **Sepolia signer**: a funded EOA (`L1_PRIVATE_KEY`), an RPC (`L1_RPC_URL`), `L1_CHAIN_ID=11155111`.
 4. **Aztec testnet**: the node URL (`AZTEC_NODE_URL`) and a funded account.
 
 ## Run
 
 ```bash
-export TORNADO_CLI_DIR=/abs/path/to/tornado-cli
 export SEPOLIA_TORNADO_POOL=0x...            # from tornado-core migrations
+export SEPOLIA_TORNADO_POOL_DEPLOY_BLOCK=...
 export L1_RPC_URL=https://sepolia...  L1_CHAIN_ID=11155111  L1_PRIVATE_KEY=0x...
 export AZTEC_NODE_URL=https://...aztec-testnet...
 yarn rehearsal:sepolia
@@ -35,7 +34,7 @@ yarn rehearsal:sepolia
 
 ## Seams to wire on the first live run
 
-All four live in `scripts/sepolia-rehearsal.ts`:
+All three live in `scripts/sepolia-rehearsal.ts`:
 
 1. **Aztec account bootstrap** (`registerTestnetAccount`) — testnet has **no** prefunded accounts, so
    the local `registerInitialLocalNetworkAccountsInWallet` does not apply. Deploy + fund an account
@@ -43,13 +42,10 @@ All four live in `scripts/sepolia-rehearsal.ts`:
    (`proverEnabled: true`) is already set on the wallet.
 2. **Fees** — every Aztec tx costs fee juice and every Sepolia tx costs ETH. The rehearsal uses one
    funded account for both `alice`/`bob`; split into two if the faucet allows, for a truer flow.
-3. **Epoch settlement** — local uses `RollupCheatCodes` / the `EpochTestSettler`; testnet settles
+3. **Epoch settlement** — the local network settles epochs synthetically; testnet settles
    epochs for real. `getBurnWitness` already polls `computeL2ToL1MembershipWitness` (its
    `advanceL2Blocks` nudge is harmless on testnet) — it just needs a **generous timeout** (the script
    passes `1800s`; real settlement can take minutes).
-4. **Leaf set** — for a freshly deployed pool, our deposit is the only leaf (`[commitment]`, as in the
-   script). For a pool with prior deposits, reconstruct the full ordered commitment set from `Deposit`
-   events (tornado-cli ships an events cache).
 
 ## What this proves
 
@@ -57,4 +53,5 @@ A real circom1/websnark Tornado proof, bound to our CREATE2 forwarder, accepted 
 (self-deployed) Tornado verifier on a public testnet**, driving the complete
 withdraw → claim → transfer → burn → redeem path across Sepolia and Aztec testnet with real proving
 and real epoch settlement — the live end-to-end rung above the local sandbox and the mainnet-fork
-rehearsal (`scripts/real-tornado-rehearsal.ts`).
+rehearsal (`scripts/real-tornado-rehearsal.ts`), which already checks the proof against the real
+mainnet verifier.

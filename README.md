@@ -76,8 +76,8 @@ yarn portal transfer --to <addr> --amount <wei> [--from <idx|addr>]
 yarn portal burn --recipient-l1 <0x> --amount <wei> [--from <idx|addr>] [--redeem]
 ```
 
-Locally, redemption works without a prover: the local network's `EpochTestSettler` pushes each
-completed epoch's out-hash into the L1 Outbox.
+Locally, redemption works without a prover: the local network settles each epoch synthetically,
+writing its out-hash into the L1 Outbox.
 
 ## Environment
 
@@ -120,22 +120,23 @@ ETH lands at the undeployed forwarder; anyone can then call `ForwarderFactory.br
 with the same proof, which re-verifies it against the pool's verifier and finishes the original
 mint (the SDK does this automatically). Each Tornado nullifier bridges at most once.
 
-Proving is delegated to a caller-supplied `tornado-cli` (`proveViaTornadoCli`); nothing from Tornado
-is vendored.
+Proofs come from Tornado's own circom1/websnark toolchain and proving key, in the isolated, opt-in
+`prover/` package (see [SECURITY.md](./SECURITY.md)).
 
 | Tier | What | Runs |
 | ---- | ---- | ---- |
 | 1 | forwarder vs a real-mimicking mock pool | `yarn test:l1` |
 | 2 | mainnet fork vs real pool bytecode, verifier mocked | `yarn test:l1:fork` |
-| 3 | own `ETHTornado` on a fork vs the **real verifier** | `yarn rehearsal:real-tornado` (operator) |
+| 3 | mainnet fork: real 1 ETH pool, **real verifier**, full Aztec round trip | `yarn rehearsal:real-tornado` |
 | 4 | Sepolia + Aztec testnet | [docs/TESTNET.md](./docs/TESTNET.md) |
 
-Tier 3 (operator-only, see [SECURITY.md](./SECURITY.md)):
+Tier 3 deposits into the real pool on the fork, rebuilds its tree (tornado-cli's event cache plus
+`getLogs`), proves to our forwarder, and runs the local network's L1 contracts on the same fork, so
+claim → burn → redeem settle against the same L1:
 
 ```bash
-git clone https://github.com/tornadocash/tornado-cli && (cd tornado-cli && npm install)
-aztec-anvil --fork-url "$MAINNET_RPC_URL"
-TORNADO_CLI_DIR=/abs/path/to/tornado-cli L1_RPC_URL=http://localhost:8545 yarn rehearsal:real-tornado
+yarn prover:install        # npm ci --ignore-scripts in prover/ + sha256-checked circuit files
+MAINNET_RPC_URL=https://... yarn rehearsal:real-tornado   # add --own-pool or --l1-only to narrow it
 ```
 
 ## Security properties

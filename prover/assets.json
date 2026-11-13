@@ -1,0 +1,22 @@
+{
+  "source": "https://raw.githubusercontent.com/tornadocash/tornado-cli",
+  "commit": "378ddf8b8b92a4924037d7b64a94dbfd5a7dd6e8",
+  "files": {
+    "build/circuits/tornado.json": {
+      "size": 19474889,
+      "sha256": "3ddd61dbff09caeec82d8edde95c674a3c34f9e66b1fe9f2c8783e72fe536f98"
+    },
+    "build/circuits/tornadoProvingKey.bin": {
+      "size": 14522256,
+      "sha256": "8e2d2f22beafb5a9666daebca57b13f8029c3656c65fcfbcc86e2418fa16a3af"
+    },
+    "build/contracts/ETHTornado.json": {
+      "size": 181485,
+      "sha256": "5370c25ecfb57c366ea306c08961217f28c9ae1d2744e33c060d52e393ac4f35"
+    },
+    "cache/ethereum/deposits_eth_1.json": {
+      "size": 9595516,
+      "sha256": "49e5f6bb8cdec9ed9e3ed1e6aeac0defe0024f4b7c5d805ea7467744940eb92a"
+    }
+  }
+}

@@ -8,7 +8,7 @@
  *
  * Prerequisites (see docs/TESTNET.md):
  *   - A tornado-core pool deployed on Sepolia (use tornado-core's own migrations) -> SEPOLIA_TORNADO_POOL.
- *   - A tornado-cli checkout (TORNADO_CLI_DIR) for proving.
+ *   - `yarn prover:install` for proving.
  *   - Sepolia: L1_RPC_URL, L1_CHAIN_ID=11155111, L1_PRIVATE_KEY (funded).
  *   - Aztec testnet: AZTEC_NODE_URL, plus a funded account (faucet / fee juice / sponsored FPC).
  */
@@ -22,7 +22,7 @@ import {
   balanceOfPrivate,
   burnForL1Withdrawal,
   claimTornadoEth,
-  createTornadoNoteViaCli,
+  createTornadoNote,
   deployForwarderFactory,
   deployTornadoBridge,
   deployTornadoEthToken,
@@ -34,6 +34,7 @@ import {
   ONE_ETH,
   PXE_SYNC_CHAIN_TIP,
   setForwarderFactory,
+  rebuildPoolHistory,
   withdrawFromRealTornadoToBridge,
   withdrawFromAztecOnL1,
   waitForL1Success,
@@ -65,7 +66,6 @@ async function connectToAztecTestnet(nodeUrl: string): Promise<AztecConnection> 
 }
 
 export async function runSepoliaRehearsal(): Promise<{ lockedEthAfter: bigint }> {
-  const cliDir = requireEnv('TORNADO_CLI_DIR', 'a tornado-cli checkout with deps installed');
   const pool = requireEnv('SEPOLIA_TORNADO_POOL', 'a tornado-core pool deployed on Sepolia') as `0x${string}`;
   const l1Client = makeL1Client({
     rpcUrl: requireEnv('L1_RPC_URL', 'a Sepolia RPC'),
@@ -98,8 +98,8 @@ export async function runSepoliaRehearsal(): Promise<{ lockedEthAfter: bigint }>
     factory,
   };
 
-  // 3. Fresh note (tornado-cli pedersen) deposited into the Sepolia pool so we own a leaf.
-  const { note, commitment } = createTornadoNoteViaCli(cliDir);
+  // 3. Fresh note deposited into the Sepolia pool so we own a leaf.
+  const { note, commitment } = createTornadoNote({ netId: 11155111 });
   const depositHash = await l1Client.writeContract({
     address: pool,
     abi: tornadoDepositAbi,
@@ -109,14 +109,19 @@ export async function runSepoliaRehearsal(): Promise<{ lockedEthAfter: bigint }>
     account: l1Client.account!,
     chain: l1Client.chain,
   });
-  await waitForL1Success(l1Client, depositHash);
+  const depositReceipt = await waitForL1Success(l1Client, depositHash);
 
-  // 4. Real proof -> forwarder -> portal. For a freshly deployed pool our deposit is the only leaf;
-  // for a pool with prior deposits, reconstruct the full ordered commitment set (see docs/TESTNET.md).
-  const deposit = await withdrawFromRealTornadoToBridge(stack, alice, note, { cliDir, leaves: [commitment] });
+  // 4. Real proof -> forwarder -> portal, over the pool's full history up to our deposit.
+  const history = await rebuildPoolHistory({
+    client: l1Client,
+    pool,
+    blockNumber: depositReceipt.blockNumber,
+    fromBlock: BigInt(requireEnv('SEPOLIA_TORNADO_POOL_DEPLOY_BLOCK', 'the pool deployment block')),
+  });
+  const deposit = await withdrawFromRealTornadoToBridge(stack, alice, note, history);
 
   // 5. Claim privately on Aztec testnet. makeMessageConsumable + getBurnWitness poll on real timing;
-  // testnet epochs settle on their own (no EpochTestSettler), so use a generous timeout.
+  // testnet epochs settle on real proving time, so use a generous timeout.
   await makeMessageConsumable(stack, deposit, alice);
   await claimTornadoEth(token, alice, deposit);
 

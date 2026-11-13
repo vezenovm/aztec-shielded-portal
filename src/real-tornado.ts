@@ -8,21 +8,24 @@
  * commitment cannot be swapped without invalidating the Tornado proof.
  *
  * Two layers:
- *  - PURE helpers (note parsing, CREATE2 address derivation) -- deterministic, unit-tested offline
- *    (`test/real-tornado.test.ts`).
- *  - PROVING (`createTornadoNoteViaCli`, `proveViaTornadoCli`) -- DELEGATED to a caller-supplied
- *    tornado-cli checkout (`$TORNADO_CLI_DIR`) via `scripts/tornado-prove.cjs`. The classic mainnet
- *    verifier only accepts circom1 + websnark proofs from Tornado's exact trusted setup, so we reuse
- *    tornado-cli's bundled toolchain rather than re-implement it (a snarkjs/circom2 proof would be
- *    REJECTED). Nothing Tornado is vendored here; installing/running tornado-cli is the operator's
- *    consented step (see SECURITY.md). The proof packing is validated end-to-end only by the
- *    env-gated fork rehearsal (`scripts/real-tornado-rehearsal.ts`), never by the offline suite.
+ *  - Pure helpers (note parsing, CREATE2 address derivation), unit-tested offline.
+ *  - Proving, delegated to the opt-in `prover/` package: the classic verifier only accepts circom1 +
+ *    websnark proofs from Tornado's trusted setup, so we run that toolchain rather than re-implement
+ *    it. It is exercised only by the fork rehearsal (`scripts/real-tornado-rehearsal.ts`).
  */
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { concat, encodeAbiParameters, getContractAddress, keccak256, parseAbiParameters } from 'viem';
+import {
+  concat,
+  encodeAbiParameters,
+  getContractAddress,
+  keccak256,
+  parseAbi,
+  parseAbiParameters,
+  type PublicClient,
+} from 'viem';
 
 import { ForwarderBytecode } from './l1-artifacts.js';
 
@@ -95,11 +98,10 @@ export function computeForwarderAddress(
 }
 
 /* -------------------------------------------------------------------------- */
-/*           Proving: delegated to a BYO tornado-cli ($TORNADO_CLI_DIR)        */
+/*                 Proving: the isolated prover/ package (opt-in)              */
 /* -------------------------------------------------------------------------- */
 
-/** scripts/tornado-prove.cjs -- the CJS port run inside the tornado-cli checkout. */
-const PROVE_HELPER = join(dirname(fileURLToPath(import.meta.url)), '../scripts/tornado-prove.cjs');
+const PROVER = join(dirname(fileURLToPath(import.meta.url)), '../prover/prove.cjs');
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
@@ -113,38 +115,31 @@ export interface TornadoProof {
 }
 
 /**
- * Run `scripts/tornado-prove.cjs` inside `cliDir` ($TORNADO_CLI_DIR) so its requires resolve against
- * tornado-cli's (circom1 + websnark) node_modules and its `build/circuits` artifacts. The payload
- * (which carries the spendable note) goes over stdin, never argv. Throws with only the helper's
- * stderr if tornado-cli is missing/uninstalled -- that toolchain is the operator's to set up.
+ * Run `prover/prove.cjs` (installed by `yarn prover:install`). The payload carries the spendable
+ * note, so it goes over stdin, and a failure is rethrown with only the child's stderr.
  */
-function runHelper(cliDir: string, sub: 'create-note' | 'prove', payload: unknown): unknown {
+function runProver(sub: 'create-note' | 'prove', payload: unknown): unknown {
   let out: string;
   try {
-    out = execFileSync(process.execPath, [PROVE_HELPER, sub], {
-      cwd: cliDir,
+    out = execFileSync(process.execPath, [PROVER, sub], {
       input: JSON.stringify(payload),
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
+      timeout: 15 * 60_000,
     });
   } catch (err) {
-    // Deliberately drop the spawn error's message/options: rebuild from the helper's stderr only.
     const stderr = String((err as { stderr?: unknown }).stderr ?? '').trim();
-    throw new Error(`tornado-prove ${sub} failed in ${cliDir}: ${stderr || 'no output'}`);
+    throw new Error(`tornado prover ${sub} failed: ${stderr || 'no output (run `yarn prover:install`)'}`);
   }
   return JSON.parse(out.trim().split('\n').pop() as string);
 }
 
-/**
- * Generate a fresh Tornado note + commitment via tornado-cli's pedersen derivation. Used by the
- * rehearsal to deposit a leaf we own into the (forked) pool before proving against it.
- */
-export function createTornadoNoteViaCli(
-  cliDir: string,
+/** A fresh Tornado note and its pedersen commitment, ready to `deposit` into a pool. */
+export function createTornadoNote(
   opts: { currency?: string; amount?: string; netId?: number } = {},
 ): { note: string; commitment: `0x${string}`; nullifierHash: `0x${string}` } {
-  return runHelper(cliDir, 'create-note', {
+  return runProver('create-note', {
     currency: opts.currency ?? 'eth',
     amount: opts.amount ?? '1',
     netId: opts.netId ?? 1,
@@ -152,26 +147,44 @@ export function createTornadoNoteViaCli(
 }
 
 /**
- * Generate a real Tornado Classic withdrawal proof bound to `recipient` (the forwarder address) by
- * delegating to `scripts/tornado-prove.cjs` inside `cliDir`. `leaves` is the ordered pool commitment
- * set INCLUDING ours; for a freshly self-deployed pool whose only deposit is ours, pass `[commitment]`.
- * `relayer`/`fee`/`refund` are hard-zeroed (relayers out of scope this milestone).
+ * A Tornado Classic withdrawal proof bound to `recipient` (the forwarder address). `leaves` is the
+ * pool's ordered commitment list including ours; with `expectedRoot` the prover refuses to prove
+ * against any other rebuilt root. Relayer, fee and refund are zero.
  */
-export function proveViaTornadoCli(opts: {
-  cliDir: string;
+export function proveTornadoWithdrawal(opts: {
   note: string;
   recipient: `0x${string}`;
   leaves: Array<`0x${string}` | string>;
-  relayer?: `0x${string}`;
-  fee?: bigint;
-  refund?: bigint;
+  expectedRoot?: `0x${string}`;
 }): TornadoProof {
-  return runHelper(opts.cliDir, 'prove', {
+  return runProver('prove', {
     note: opts.note,
     recipient: opts.recipient,
     leaves: opts.leaves.map(String),
-    relayer: opts.relayer ?? ZERO_ADDRESS,
-    fee: (opts.fee ?? 0n).toString(),
-    refund: (opts.refund ?? 0n).toString(),
+    expectedRoot: opts.expectedRoot,
+    relayer: ZERO_ADDRESS,
+    fee: '0',
+    refund: '0',
   }) as TornadoProof;
+}
+
+const verifierAbi = parseAbi(['function verifyProof(bytes proof, uint256[6] input) view returns (bool)']);
+
+/** Ask a Tornado `Verifier` directly whether it accepts `proof` for the given public args. */
+export async function verifyTornadoProof(
+  client: Pick<PublicClient, 'readContract'>,
+  verifier: `0x${string}`,
+  proof: `0x${string}`,
+  args: TornadoProof['args'],
+): Promise<boolean> {
+  try {
+    return await client.readContract({
+      address: verifier,
+      abi: verifierAbi,
+      functionName: 'verifyProof',
+      args: [proof, args.map(BigInt) as [bigint, bigint, bigint, bigint, bigint, bigint]],
+    });
+  } catch {
+    return false;
+  }
 }

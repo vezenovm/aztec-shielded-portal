@@ -41,5 +41,5 @@ jobs:
 
 # Intentionally NOT run in CI:
 #   - yarn test:aztec / yarn test:e2e  -> require `aztec start --local-network` (heavyweight); run locally.
-#   - yarn test:fork                   -> requires a BYO tornado-cli (old, untrusted third-party
-#                                         toolchain) + a mainnet fork. Operator-run only. See SECURITY.md.
+#   - yarn prover:install / test:fork  -> the isolated legacy Tornado prover + a mainnet fork and the
+#                                         local network. Operator-run only. See SECURITY.md.
