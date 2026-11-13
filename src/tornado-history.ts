@@ -54,27 +54,39 @@ export function loadDepositCache(path = ETH_1_DEPOSIT_CACHE): DepositEvent[] {
   }));
 }
 
-/** Deposit logs in [fromBlock, toBlock], halving the range whenever the provider refuses it. */
+/**
+ * Deposit logs in [fromBlock, toBlock]. A failed request is retried (free RPC tiers rate-limit),
+ * then the range is halved (they also cap the block span); it grows back after each success.
+ */
 export async function fetchDeposits(
   client: LogsClient,
   pool: `0x${string}`,
   fromBlock: bigint,
   toBlock: bigint,
-  opts: { maxRange?: bigint; onProgress?: (block: bigint) => void } = {},
+  opts: { maxRange?: bigint; retries?: number; onProgress?: (block: bigint) => void } = {},
 ): Promise<DepositEvent[]> {
   const out: DepositEvent[] = [];
-  let range = opts.maxRange ?? 50_000n;
+  const retries = opts.retries ?? 3;
+  const maxRange = opts.maxRange ?? 5_000n;
+  let range = maxRange;
   let from = fromBlock;
+  let failures = 0;
   while (from <= toBlock) {
     const to = from + range - 1n < toBlock ? from + range - 1n : toBlock;
     let logs;
     try {
       logs = await client.getLogs({ address: pool, event: depositEvent, fromBlock: from, toBlock: to });
+      failures = 0;
     } catch (err) {
+      if (++failures <= retries) {
+        await new Promise(r => setTimeout(r, 500 * 2 ** failures));
+        continue;
+      }
       if (range === 1n) {
         throw err;
       }
       range = range / 2n;
+      failures = 0;
       continue;
     }
     for (const log of logs) {
@@ -86,6 +98,7 @@ export async function fetchDeposits(
     }
     opts.onProgress?.(to);
     from = to + 1n;
+    range = range * 2n < maxRange ? range * 2n : maxRange;
   }
   return out;
 }
@@ -124,6 +137,10 @@ export function mergeDeposits(...sources: DepositEvent[][]): `0x${string}`[] {
  * Snapshot a pool's leaves and root at `blockNumber`. `cache` seeds the history (tornado-cli's
  * events for the canonical pool); logs are fetched from the cache's last block (inclusive, so a
  * partially cached block is re-read) or `fromBlock` for a pool with no cache.
+ *
+ * On a fork, pass `upstream` + `forkBlock`: blocks up to the fork point are read from the upstream
+ * RPC directly (Anvil's forwarding of historical `getLogs` does not respect the provider's range
+ * caps), and only later blocks from `client`.
  */
 export async function rebuildPoolHistory(opts: {
   client: LogsClient & Pick<PublicClient, 'readContract'>;
@@ -131,11 +148,23 @@ export async function rebuildPoolHistory(opts: {
   blockNumber: bigint;
   cache?: DepositEvent[];
   fromBlock?: bigint;
+  upstream?: LogsClient;
+  forkBlock?: bigint;
   onProgress?: (block: bigint) => void;
 }): Promise<PoolHistory> {
   const cache = (opts.cache ?? []).filter(e => BigInt(e.blockNumber) <= opts.blockNumber);
   const start = cache.length ? BigInt(cache[cache.length - 1].blockNumber) : (opts.fromBlock ?? 0n);
-  const tail = await fetchDeposits(opts.client, opts.pool, start, opts.blockNumber, { onProgress: opts.onProgress });
+  const fetchOpts = { onProgress: opts.onProgress };
+  let tail: DepositEvent[];
+  if (opts.upstream && opts.forkBlock !== undefined && start <= opts.forkBlock) {
+    const split = opts.forkBlock < opts.blockNumber ? opts.forkBlock : opts.blockNumber;
+    tail = await fetchDeposits(opts.upstream, opts.pool, start, split, fetchOpts);
+    if (split < opts.blockNumber) {
+      tail.push(...(await fetchDeposits(opts.client, opts.pool, split + 1n, opts.blockNumber, fetchOpts)));
+    }
+  } else {
+    tail = await fetchDeposits(opts.client, opts.pool, start, opts.blockNumber, fetchOpts);
+  }
   const leaves = mergeDeposits(cache, tail);
 
   const at = { address: opts.pool, abi: poolAbi, blockNumber: opts.blockNumber } as const;

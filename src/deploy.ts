@@ -720,20 +720,30 @@ const ETH_TORNADO_ARTIFACT = join(
 );
 
 /**
- * Deploy our own ETHTornado from tornado-cli's prebuilt artifact (fetched by `yarn prover:install`).
- * Intended for a mainnet fork: pass the real Verifier (via {@link readTornadoVerifier}); the artifact
- * links the canonical MiMC hasher at its mainnet address, which the fork has.
+ * The MiMC Hasher library the canonical ETH pools link. With it, the ETHTornado artifact is
+ * byte-identical (bar the metadata hash) to the deployed 1 ETH pool.
+ */
+export const TORNADO_HASHER_MAINNET = '0x83584f83f26aF4eDDA9CBe8C730bc87C364b28fe' as const;
+
+/**
+ * Deploy our own ETHTornado from tornado-cli's prebuilt artifact (fetched by `yarn prover:install`),
+ * linked to the canonical Hasher. Intended for a mainnet fork, with the real Verifier from
+ * {@link readTornadoVerifier}.
  */
 export async function deployOwnTornadoPool(
   client: L1Client,
   opts: { verifier: `0x${string}`; denomination?: bigint; merkleTreeHeight?: number; operator?: `0x${string}` },
 ): Promise<`0x${string}`> {
-  const artifact = JSON.parse(readFileSync(ETH_TORNADO_ARTIFACT, 'utf8')) as {
-    abi: Abi;
-    bytecode: string;
-  };
+  const artifact = JSON.parse(readFileSync(ETH_TORNADO_ARTIFACT, 'utf8')) as { abi: Abi; bytecode: string };
+  if (!(await client.getCode({ address: TORNADO_HASHER_MAINNET }))) {
+    throw new Error(`no Tornado Hasher at ${TORNADO_HASHER_MAINNET}; deployOwnTornadoPool needs a mainnet fork`);
+  }
+  const bytecode = artifact.bytecode.replaceAll(
+    '__Hasher________________________________',
+    TORNADO_HASHER_MAINNET.slice(2).toLowerCase(),
+  ) as `0x${string}`;
   const operator = opts.operator ?? (client.account!.address as `0x${string}`);
-  return deployL1ContractChecked(client, artifact.abi, artifact.bytecode as `0x${string}`, [
+  return deployL1ContractChecked(client, artifact.abi, bytecode, [
     opts.verifier,
     opts.denomination ?? ONE_ETH,
     opts.merkleTreeHeight ?? 20,

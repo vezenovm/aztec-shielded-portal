@@ -127,17 +127,20 @@ Proofs come from Tornado's own circom1/websnark toolchain and proving key, in th
 | ---- | ---- | ---- |
 | 1 | forwarder vs a real-mimicking mock pool | `yarn test:l1` |
 | 2 | mainnet fork vs real pool bytecode, verifier mocked | `yarn test:l1:fork` |
-| 3 | mainnet fork: real 1 ETH pool, **real verifier**, full Aztec round trip | `yarn rehearsal:real-tornado` |
+| 3 | mainnet fork: **real verifier**, full Aztec round trip | `yarn rehearsal:real-tornado` |
 | 4 | Sepolia + Aztec testnet | [docs/TESTNET.md](./docs/TESTNET.md) |
 
-Tier 3 deposits into the real pool on the fork, rebuilds its tree (tornado-cli's event cache plus
-`getLogs`), proves to our forwarder, and runs the local network's L1 contracts on the same fork, so
-claim → burn → redeem settle against the same L1:
+Tier 3 deploys a copy of the 1 ETH pool on the fork (its exact bytecode, linked to the canonical
+Hasher and pointed at the canonical Verifier), deposits, proves to our forwarder, and runs the local
+network's L1 contracts on the same fork, so claim → burn → redeem settle against the same L1:
 
 ```bash
 yarn prover:install        # npm ci --ignore-scripts in prover/ + sha256-checked circuit files
-MAINNET_RPC_URL=https://... yarn rehearsal:real-tornado   # add --own-pool or --l1-only to narrow it
+MAINNET_RPC_URL=https://eth.drpc.org yarn rehearsal:real-tornado
 ```
+
+`--real-pool` uses the canonical pool instead, rebuilding its tree from tornado-cli's event cache plus
+`getLogs`; that needs an RPC serving wide `getLogs` ranges. `--l1-only` stops at the portal.
 
 ## Security properties
 

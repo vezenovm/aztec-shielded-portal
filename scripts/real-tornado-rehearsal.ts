@@ -2,22 +2,26 @@
  * Real-Tornado rehearsal on a mainnet fork: a Groth16 proof from Tornado's own toolchain and proving
  * key, checked by the real on-chain verifier, driving the whole bridge round trip:
  *
- *   deposit into the real 1 ETH pool -> rebuild its tree -> prove to our forwarder
+ *   deposit into a Tornado pool -> rebuild its tree -> prove to our forwarder
  *   -> ForwarderFactory.withdrawAndBridge -> portal -> L1->L2 message -> private mint on Aztec
  *   -> burn -> L2->L1 message -> redeem on L1
  *
  * The Aztec local network deploys its L1 contracts onto the same fork, so both halves share one L1.
  *
+ * The pool defaults to our own ETHTornado: the canonical 1 ETH pool's exact code, Hasher and real
+ * Verifier, with our deposit as its only leaf, so no history is needed.
+ *
  * Flags:
- *   --own-pool  deploy our own ETHTornado (real verifier, no deposit history) instead of the real pool
- *   --l1-only   stop after the portal locks the ETH; Aztec messaging is mocked, no local network
+ *   --real-pool  use the canonical 1 ETH pool instead; rebuilding its ~12M-block log tail needs an RPC
+ *                that serves wide eth_getLogs ranges (free public tiers cap them at ~100 blocks)
+ *   --l1-only    stop after the portal locks the ETH; Aztec messaging is mocked, no local network
  *
  * Env: MAINNET_RPC_URL (starts the fork + local network), or L1_RPC_URL [+ AZTEC_NODE_URL] to attach
  * to a fork already running with chain id 31337. Needs `yarn prover:install`.
  */
 import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
 import { EthAddress } from '@aztec-labs/foundation/eth-address';
-import { type Abi, parseAbi } from 'viem';
+import { type Abi, createPublicClient, http, parseAbi } from 'viem';
 
 import MockInboxJson from '../contracts/l1/out/MessagingMocks.sol/MockInbox.json' with { type: 'json' };
 import MockOutboxJson from '../contracts/l1/out/MessagingMocks.sol/MockOutbox.json' with { type: 'json' };
@@ -73,6 +77,17 @@ export interface RehearsalResult {
   redeemed?: bigint;
 }
 
+/** Print getLogs progress roughly every 500k blocks. */
+function logProgress(): (block: bigint) => void {
+  let next = 0n;
+  return block => {
+    if (block >= next) {
+      console.log(`  logs through block ${block}`);
+      next = block + 500_000n;
+    }
+  };
+}
+
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) {
     throw new Error(`rehearsal check failed: ${msg}`);
@@ -106,7 +121,7 @@ async function setupL1OnlyStack(client: L1Client, pool: `0x${string}`) {
 }
 
 export async function runRealTornadoRehearsal(
-  opts: { ownPool?: boolean; l1Only?: boolean } = {},
+  opts: { realPool?: boolean; l1Only?: boolean } = {},
 ): Promise<RehearsalResult> {
   let network: ForkNetwork | undefined;
   if (process.env.MAINNET_RPC_URL) {
@@ -122,10 +137,10 @@ export async function runRealTornadoRehearsal(
     await assertAnvilFork(client);
     const forkBlock = network?.forkBlock ?? (await client.getBlockNumber());
 
-    // 1. The pool: the canonical 1 ETH instance, or our own one pointed at its verifier.
+    // 1. The pool: our own copy of the 1 ETH instance pointed at its verifier, or the canonical one.
     let pool: `0x${string}` = TORNADO_1ETH_MAINNET;
     let poolDeployBlock: bigint | undefined;
-    if (opts.ownPool) {
+    if (!opts.realPool) {
       pool = await deployOwnTornadoPool(client, { verifier: await readTornadoVerifier(client, TORNADO_1ETH_MAINNET) });
       poolDeployBlock = await client.getBlockNumber();
     }
@@ -155,8 +170,13 @@ export async function runRealTornadoRehearsal(
       client,
       pool,
       blockNumber: depositReceipt.blockNumber,
-      cache: opts.ownPool ? undefined : loadDepositCache(),
+      cache: opts.realPool ? loadDepositCache() : undefined,
       fromBlock: poolDeployBlock,
+      upstream: process.env.MAINNET_RPC_URL
+        ? createPublicClient({ transport: http(process.env.MAINNET_RPC_URL) })
+        : undefined,
+      forkBlock,
+      onProgress: logProgress(),
     });
     assert(history.leaves.at(-1) === commitment.toLowerCase(), 'our deposit is the last leaf');
     console.log(`${history.leaves.length} leaves, root ${history.root}`);
@@ -227,7 +247,7 @@ export async function runRealTornadoRehearsal(
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  runRealTornadoRehearsal({ ownPool: process.argv.includes('--own-pool'), l1Only: process.argv.includes('--l1-only') })
+  runRealTornadoRehearsal({ realPool: process.argv.includes('--real-pool'), l1Only: process.argv.includes('--l1-only') })
     .then(result => {
       console.log(JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
       process.exit(0);

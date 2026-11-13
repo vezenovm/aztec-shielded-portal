@@ -24,7 +24,7 @@ test('fetchDeposits halves the block range until the provider accepts it', async
       return [];
     },
   };
-  await fetchDeposits(client as never, `0x${'00'.repeat(20)}`, 0n, 99n, { maxRange: 100n });
+  await fetchDeposits(client as never, `0x${'00'.repeat(20)}`, 0n, 99n, { maxRange: 100n, retries: 0 });
   assert.deepEqual(ranges, [
     [0n, 24n],
     [25n, 49n],

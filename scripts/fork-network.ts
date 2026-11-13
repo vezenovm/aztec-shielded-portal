@@ -10,7 +10,6 @@ import { createWriteStream, mkdirSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 
-import { createAztecNodeClient } from '@aztec-labs/aztec.js/node';
 import { createPublicClient, http } from 'viem';
 
 export interface ForkNetwork {
@@ -115,8 +114,16 @@ export async function startForkNetwork(opts: {
     });
     children.push(aztec);
     const aztecNodeUrl = `http://127.0.0.1:${aztecPort}`;
-    const node = createAztecNodeClient(aztecNodeUrl);
-    await waitFor('aztec local network', aztec, () => node.isReady(), 600_000);
+    // A raw single-shot request: the SDK node client logs an error for every refused connection.
+    const isReady = async () => {
+      const res = await fetch(aztecNodeUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'aztec_isReady', params: [] }),
+      });
+      return ((await res.json()) as { result?: boolean }).result === true;
+    };
+    await waitFor('aztec local network', aztec, isReady, 600_000);
     return { l1RpcUrl, aztecNodeUrl, forkBlock, stop };
   } catch (err) {
     stop();
