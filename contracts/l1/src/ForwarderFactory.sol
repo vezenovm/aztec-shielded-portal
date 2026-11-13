@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.8.27;
 
-import {ITornadoInstance} from "./ITornadoInstance.sol";
+import {ITornadoInstance, ITornadoVerifier} from "./ITornadoInstance.sol";
 import {Forwarder} from "./Forwarder.sol";
 
 /**
@@ -16,6 +16,15 @@ import {Forwarder} from "./Forwarder.sol";
  * a proof copied from the mempool can only ever mint to the original commitment. `fee`/`refund` are
  * hard-zeroed -- relayers are out of scope for the PoC, and a non-zero fee would make the pool pay
  * out less than DENOMINATION and break the portal's strict value check.
+ *
+ * Front-running: Tornado authenticates the proof's public signals, not the caller, so anyone can
+ * replay a pending `withdrawAndBridge` proof directly against the pool. That pays DENOMINATION to the
+ * (still undeployed) forwarder and spends the nullifier, making `withdrawAndBridge` revert.
+ * `bridgeSpentWithdrawal` completes such a withdrawal: it re-verifies the same proof against the
+ * pool's verifier with the forwarder as recipient, so it can only ever finish the original mint.
+ *
+ * Each nullifier bridges at most once across both paths (`bridgedNullifiers`), so every mint is
+ * backed by DENOMINATION and a distinct spent Tornado note.
  *
  * PoC: not production-ready. See README for the threat-model simplifications.
  */
@@ -34,6 +43,12 @@ contract ForwarderFactory {
 
   error EmptyCommitment();
   error ForwarderAddressMismatch(address deployed, address expected);
+  error WithdrawalNotSpent(bytes32 nullifierHash);
+  error InvalidWithdrawProof();
+  error NullifierAlreadyBridged(bytes32 nullifierHash);
+
+  /// @notice Tornado nullifiers already bridged by either path (one deposit per Tornado withdrawal).
+  mapping(bytes32 nullifierHash => bool bridged) public bridgedNullifiers;
 
   constructor(address _portal, ITornadoInstance _tornado) {
     PORTAL = _portal;
@@ -60,6 +75,7 @@ contract ForwarderFactory {
     bytes32 _aztecMintCommitment
   ) external {
     require(_aztecMintCommitment != 0, EmptyCommitment());
+    _markBridged(_nullifierHash);
 
     Forwarder forwarder = _deployForwarder(_aztecMintCommitment);
 
@@ -69,6 +85,38 @@ contract ForwarderFactory {
     );
 
     // Hand exactly DENOMINATION to the portal as an attributable Tornado-origin deposit.
+    forwarder.flushToPortal(_nullifierHash, _aztecMintCommitment);
+
+    emit ForwarderWithdrawal(address(forwarder), _nullifierHash, _aztecMintCommitment, DENOMINATION);
+  }
+
+  /**
+   * @notice Bridge a Tornado withdrawal that was already executed directly against the pool with
+   * this commitment's forwarder as recipient (e.g. a front-runner replayed the proof), leaving
+   * DENOMINATION at the forwarder address. Permissionless: the proof can only mint to its commitment.
+   * @dev Requires (a) the nullifier is spent on the pool and (b) the pool's verifier accepts the proof
+   * for `[root, nullifierHash, forwarder, 0, 0, 0]`. A spent nullifier alone is NOT sufficient:
+   * nullifier hashes are public, but a valid proof requires the note's nullifier preimage, i.e. the
+   * note owner's authorization of this commitment. The root is not re-checked against the pool's
+   * root history, which may have rotated since the withdrawal; the proof already binds the owner.
+   * The portal's depositId guard keyed on (forwarder, nullifier) keeps this single-use.
+   */
+  function bridgeSpentWithdrawal(
+    bytes calldata _proof,
+    bytes32 _root,
+    bytes32 _nullifierHash,
+    bytes32 _aztecMintCommitment
+  ) external {
+    require(_aztecMintCommitment != 0, EmptyCommitment());
+    require(TORNADO.nullifierHashes(_nullifierHash), WithdrawalNotSpent(_nullifierHash));
+    _markBridged(_nullifierHash);
+
+    address forwarderAddress = computeForwarderAddress(_aztecMintCommitment);
+    uint256[6] memory input =
+      [uint256(_root), uint256(_nullifierHash), uint256(uint160(forwarderAddress)), 0, 0, 0];
+    require(ITornadoVerifier(TORNADO.verifier()).verifyProof(_proof, input), InvalidWithdrawProof());
+
+    Forwarder forwarder = _deployForwarder(_aztecMintCommitment);
     forwarder.flushToPortal(_nullifierHash, _aztecMintCommitment);
 
     emit ForwarderWithdrawal(address(forwarder), _nullifierHash, _aztecMintCommitment, DENOMINATION);
@@ -87,6 +135,11 @@ contract ForwarderFactory {
         )
       )
     );
+  }
+
+  function _markBridged(bytes32 _nullifierHash) internal {
+    require(!bridgedNullifiers[_nullifierHash], NullifierAlreadyBridged(_nullifierHash));
+    bridgedNullifiers[_nullifierHash] = true;
   }
 
   function _deployForwarder(bytes32 _commitment) internal returns (Forwarder) {

@@ -12,7 +12,7 @@
  *
  * Run: yarn test:e2e
  */
-import type { AztecAddress } from '@aztec/aztec.js/addresses';
+import type { AztecAddress } from '@aztec-labs/aztec.js/addresses';
 import assert from 'node:assert/strict';
 import { before, describe, it } from 'node:test';
 

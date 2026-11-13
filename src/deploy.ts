@@ -9,19 +9,22 @@
  * epoch's out-hash into the L1 Outbox (epoch duration = 2 checkpoints), which is what
  * makes L2->L1 redemption work without a prover.
  */
-import type { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
-import { createAztecNodeClient } from '@aztec/aztec.js/node';
-import { createExtendedL1Client } from '@aztec/ethereum/client';
-import { OutboxContract } from '@aztec/ethereum/contracts';
-import { deployL1Contract } from '@aztec/ethereum/deploy-l1-contract';
-import { EthAddress } from '@aztec/foundation/eth-address';
-import { retryUntil } from '@aztec/foundation/retry';
-import { computeL2ToL1MembershipWitness } from '@aztec/stdlib/messaging';
-import type { TxReceipt } from '@aztec/stdlib/tx';
-import { EmbeddedWallet } from '@aztec/wallets/embedded';
-import { registerInitialLocalNetworkAccountsInWallet } from '@aztec/wallets/testing';
-import { defineChain, parseEventLogs, type Chain } from 'viem';
+import { readFileSync } from 'node:fs';
+
+import type { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { Fr } from '@aztec-labs/aztec.js/fields';
+import { isL1ToL2MessageReady } from '@aztec-labs/aztec.js/messaging';
+import { createAztecNodeClient } from '@aztec-labs/aztec.js/node';
+import { createExtendedL1Client } from '@aztec-labs/ethereum/client';
+import { OutboxContract } from '@aztec-labs/ethereum/contracts';
+import { deployL1Contract } from '@aztec-labs/ethereum/deploy-l1-contract';
+import { EthAddress } from '@aztec-labs/foundation/eth-address';
+import { retryUntil } from '@aztec-labs/foundation/retry';
+import { computeL2ToL1MembershipWitness } from '@aztec-labs/stdlib/messaging';
+import type { MinedTxReceipt, TxReceipt } from '@aztec-labs/stdlib/tx';
+import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
+import { registerInitialLocalNetworkAccountsInWallet } from '@aztec-labs/wallets/testing';
+import { defineChain, parseAbi, parseEventLogs, type Abi, type Chain, type TransactionReceipt } from 'viem';
 import { foundry } from 'viem/chains';
 
 import { computeAztecMintCommitment, generateMintSecret } from './commitment.js';
@@ -37,13 +40,28 @@ import {
   TornadoEthBridgeL1Abi,
   TornadoEthBridgeL1Bytecode,
 } from './l1-artifacts.js';
-import { buildRealWithdrawalPayload } from './real-tornado.js';
+import { computeForwarderAddress, proveViaTornadoCli } from './real-tornado.js';
 
 export const DEFAULT_L1_RPC_URL = 'http://localhost:8545';
 export const DEFAULT_L1_CHAIN_ID = foundry.id;
 export const L1_RPC_URL = process.env.L1_RPC_URL ?? DEFAULT_L1_RPC_URL;
 export const L1_CHAIN_ID = Number(process.env.L1_CHAIN_ID ?? DEFAULT_L1_CHAIN_ID);
 export const AZTEC_NODE_URL = process.env.AZTEC_NODE_URL ?? 'http://localhost:8080';
+
+const SYNC_CHAIN_TIPS = ['proposed', 'checkpointed', 'proven', 'finalized'] as const;
+type SyncChainTip = (typeof SYNC_CHAIN_TIPS)[number];
+
+/**
+ * The chain tip the wallet's PXE anchors transactions to. L1->L2 readiness is checked at the same
+ * tip, so a message "ready" at a newer tip can't pass the check yet fail the claim's membership proof.
+ */
+export const PXE_SYNC_CHAIN_TIP: SyncChainTip = (() => {
+  const tip = process.env.PXE_SYNC_CHAIN_TIP ?? 'proposed';
+  if (!(SYNC_CHAIN_TIPS as readonly string[]).includes(tip)) {
+    throw new Error(`PXE_SYNC_CHAIN_TIP must be one of ${SYNC_CHAIN_TIPS.join(', ')} (got ${tip})`);
+  }
+  return tip as SyncChainTip;
+})();
 /** Anvil's well-known dev mnemonic; HD account 0 deploys and owns the L1 contracts. */
 export const TEST_MNEMONIC = 'test test test test test test test test test test test junk';
 
@@ -180,7 +198,7 @@ export async function connectToAztec(nodeUrl = AZTEC_NODE_URL): Promise<AztecCon
   const node = createAztecNodeClient(nodeUrl);
   const wallet = await EmbeddedWallet.create(nodeUrl, {
     ephemeral: true,
-    pxeConfig: { proverEnabled: false },
+    pxeConfig: { proverEnabled: false, syncChainTip: PXE_SYNC_CHAIN_TIP },
   });
   const accounts = await registerInitialLocalNetworkAccountsInWallet(wallet);
   if (accounts.length < 2) {
@@ -189,24 +207,77 @@ export async function connectToAztec(nodeUrl = AZTEC_NODE_URL): Promise<AztecCon
   return { node, wallet, accounts };
 }
 
+/**
+ * Wait for an L1 tx and require it succeeded. viem resolves `waitForTransactionReceipt` for mined
+ * txs with `status: 'reverted'` too, which would otherwise read as success (e.g. a redemption whose
+ * outbox leaf another executor consumed first, or whose recipient rejects ETH).
+ */
+export async function waitForL1Success(
+  client: Pick<L1Client, 'waitForTransactionReceipt'>,
+  hash: `0x${string}`,
+): Promise<TransactionReceipt> {
+  const receipt = await client.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') {
+    throw new Error(`L1 tx ${hash} reverted`);
+  }
+  return receipt;
+}
+
+/**
+ * `deployL1Contract`, but fail loudly on a reverted deployment: the underlying helper returns the
+ * predicted address even when the creation tx reverted, so follow-up writes (e.g. funding a pool)
+ * would succeed against an address with no code.
+ */
+export async function deployL1ContractChecked(
+  client: L1Client,
+  abi: Abi,
+  bytecode: `0x${string}`,
+  args: readonly unknown[],
+): Promise<`0x${string}`> {
+  const { address, txHash } = await deployL1Contract(client, abi, bytecode, args);
+  if (txHash) {
+    await waitForL1Success(client, txHash);
+  }
+  const deployed = address.toString() as `0x${string}`;
+  const code = await client.getCode({ address: deployed });
+  if (!code || code === '0x') {
+    throw new Error(`L1 deployment left no code at ${deployed}`);
+  }
+  return deployed;
+}
+
+/**
+ * Attach to an already-deployed tornadoETH from a fresh wallet: fetch the instance from the node
+ * and register it with the artifact (a new PXE knows nothing about contracts it did not deploy).
+ */
+export async function loadTornadoEthToken(
+  conn: Pick<AztecConnection, 'node' | 'wallet'>,
+  address: AztecAddress,
+): Promise<TornadoEthTokenContract> {
+  const instance = await conn.node.getContract(address);
+  if (!instance) {
+    throw new Error(`No contract deployed at ${address.toString()} -- stale state from an earlier network? Re-run setup.`);
+  }
+  await conn.wallet.registerContract(instance, TornadoEthTokenContract.artifact);
+  return TornadoEthTokenContract.at(address, conn.wallet);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                 Deployment                                 */
 /* -------------------------------------------------------------------------- */
 
 export async function deployMockTornadoPool(client: L1Client, denomination: bigint): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, MockTornadoPoolAbi, MockTornadoPoolBytecode, [denomination]);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, MockTornadoPoolAbi, MockTornadoPoolBytecode, [denomination]);
 }
 
 export async function deployTornadoBridge(client: L1Client): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, TornadoEthBridgeL1Abi, TornadoEthBridgeL1Bytecode, []);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, TornadoEthBridgeL1Abi, TornadoEthBridgeL1Bytecode, []);
 }
 
 /** Fund the mock pool with ETH (stands in for Tornado deposits). */
 export async function fundPool(client: L1Client, pool: `0x${string}`, amount: bigint): Promise<void> {
   const hash = await client.sendTransaction({ to: pool, value: amount, account: client.account!, chain: client.chain });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 export async function approvePool(
@@ -223,7 +294,7 @@ export async function approvePool(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 export async function deployTornadoEthToken(
@@ -252,7 +323,7 @@ export async function initializeBridge(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 export interface BridgeStack {
@@ -366,7 +437,7 @@ export async function withdrawFromTornadoToBridge(
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
   });
-  const receipt = await stack.l1Client.waitForTransactionReceipt({ hash });
+  const receipt = await waitForL1Success(stack.l1Client, hash);
 
   const [log] = parseEventLogs({
     abi: TornadoEthBridgeL1Abi,
@@ -396,21 +467,7 @@ export async function withdrawFromTornadoToBridge(
   };
 }
 
-/** Wait until the archiver has indexed the L1->L2 message. */
-export async function waitForMessageSeen(node: AztecNode, messageHash: Fr, timeoutSec = 90): Promise<void> {
-  await retryUntil(
-    async () => (await node.getL1ToL2MessageCheckpoint(messageHash)) !== undefined,
-    `L1->L2 message ${messageHash.toString()} indexed`,
-    timeoutSec,
-    1,
-  );
-}
-
-/**
- * Progress the rollup by `blocks` L2 blocks using no-op self-transfers. An L1->L2
- * message becomes consumable two blocks after insertion (one for subtree inclusion,
- * one for tree availability) — mirrors the canonical harness's makeMessageConsumable.
- */
+/** Progress the rollup by `blocks` L2 blocks using no-op self-transfers. */
 export async function advanceL2Blocks(
   token: TornadoEthTokenContract,
   account: AztecAddress,
@@ -421,14 +478,36 @@ export async function advanceL2Blocks(
   }
 }
 
-/** Make a deposit's L1->L2 message consumable: wait for indexing + 2 L2 blocks. */
+/**
+ * Make a deposit's L1->L2 message consumable: produce L2 blocks until one has inserted the
+ * message into the L1->L2 message tree (Inbox buckets make the exact block count timing-dependent).
+ */
 export async function makeMessageConsumable(
   stack: Pick<BridgeStack, 'node' | 'token'>,
   deposit: TornadoDeposit,
   account: AztecAddress,
+  timeoutSec = 180,
 ): Promise<void> {
-  await waitForMessageSeen(stack.node, deposit.messageHash);
-  await advanceL2Blocks(stack.token, account, 2);
+  await retryUntil(
+    async () => {
+      if (await isL1ToL2MessageReady(stack.node, deposit.messageHash, PXE_SYNC_CHAIN_TIP)) {
+        return true;
+      }
+      await advanceL2Blocks(stack.token, account, 1);
+      return false;
+    },
+    `L1->L2 message ${deposit.messageHash.toString()} consumable`,
+    timeoutSec,
+    1,
+  );
+}
+
+/** Narrow a tx receipt to a mined one; pending/dropped receipts carry no block position. */
+export function assertMined(receipt: TxReceipt): MinedTxReceipt {
+  if (!receipt.isMined()) {
+    throw new Error(`Tx ${receipt.txHash.toString()} is not mined (status: ${receipt.status}).`);
+  }
+  return receipt;
 }
 
 /** Claim the deposit as private tornadoETH notes for `recipient` (the tx sender). */
@@ -437,7 +516,7 @@ export async function claimTornadoEth(
   recipient: AztecAddress,
   deposit: TornadoDeposit,
   overrides: { amount?: bigint; mintSecret?: Fr } = {},
-): Promise<TxReceipt> {
+): Promise<MinedTxReceipt> {
   const { receipt } = await token.methods
     .claim_from_tornado_bridge(
       Fr.fromHexString(deposit.depositId),
@@ -446,7 +525,7 @@ export async function claimTornadoEth(
       deposit.messageLeafIndex,
     )
     .send({ from: recipient });
-  return receipt;
+  return assertMined(receipt);
 }
 
 /** Private tornadoETH balance via the contract's utility function. */
@@ -460,7 +539,7 @@ export async function balanceOfPrivate(token: TornadoEthTokenContract, owner: Az
 /* -------------------------------------------------------------------------- */
 
 export interface BurnForWithdrawal {
-  receipt: TxReceipt;
+  receipt: MinedTxReceipt;
   nonce: Fr;
   recipientL1: EthAddress;
   amount: bigint;
@@ -497,7 +576,7 @@ export async function burnForL1Withdrawal(
     chainId: BigInt(stack.l1Client.chain.id),
   });
 
-  return { receipt, nonce, recipientL1: recipient, amount, messageLeaf };
+  return { receipt: assertMined(receipt), nonce, recipientL1: recipient, amount, messageLeaf };
 }
 
 export interface BurnWitness {
@@ -562,7 +641,7 @@ export async function withdrawFromAztecOnL1(
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
   });
-  await stack.l1Client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(stack.l1Client, hash);
 }
 
 /** Bridge reserve accounting, as tracked on L1. */
@@ -586,15 +665,47 @@ export async function deployForwarderFactory(
   bridge: `0x${string}`,
   tornado: `0x${string}`,
 ): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, ForwarderFactoryAbi, ForwarderFactoryBytecode, [bridge, tornado]);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, ForwarderFactoryAbi, ForwarderFactoryBytecode, [bridge, tornado]);
 }
 
 export async function deployMockRealTornadoPool(client: L1Client, denomination: bigint): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, MockRealTornadoPoolAbi, MockRealTornadoPoolBytecode, [
+  return deployL1ContractChecked(client, MockRealTornadoPoolAbi, MockRealTornadoPoolBytecode, [
     denomination,
   ]);
-  return address.toString() as `0x${string}`;
+}
+
+/** Read a Tornado pool's `verifier()` (e.g. the real 1 ETH pool on a mainnet fork). */
+export async function readTornadoVerifier(client: L1Client, pool: `0x${string}`): Promise<`0x${string}`> {
+  return (await client.readContract({
+    address: pool,
+    abi: parseAbi(['function verifier() view returns (address)']),
+    functionName: 'verifier',
+  })) as `0x${string}`;
+}
+
+/**
+ * Deploy our OWN ETHTornado from tornado-cli's prebuilt `build/contracts/ETHTornado.json` (read from
+ * `cliDir` = $TORNADO_CLI_DIR -- nothing Tornado is vendored in this repo). Intended for a mainnet
+ * FORK: pass the real on-chain Verifier (via {@link readTornadoVerifier}) so proofs validate against
+ * the canonical circom1/websnark trusted setup; the MiMC hasher is the canonical one hardcoded at its
+ * mainnet address, present on the fork. (For Sepolia, Phase 4 supplies its own Verifier + Hasher.)
+ */
+export async function deployOwnTornadoPool(
+  client: L1Client,
+  cliDir: string,
+  opts: { verifier: `0x${string}`; denomination?: bigint; merkleTreeHeight?: number; operator?: `0x${string}` },
+): Promise<`0x${string}`> {
+  const artifact = JSON.parse(readFileSync(`${cliDir}/build/contracts/ETHTornado.json`, 'utf8')) as {
+    abi: Abi;
+    bytecode: string;
+  };
+  const operator = opts.operator ?? (client.account!.address as `0x${string}`);
+  return deployL1ContractChecked(client, artifact.abi, artifact.bytecode as `0x${string}`, [
+    opts.verifier,
+    opts.denomination ?? ONE_ETH,
+    opts.merkleTreeHeight ?? 20,
+    operator,
+  ]);
 }
 
 /** Approve a ForwarderFactory as the real-Tornado ingress (owner-only). */
@@ -611,7 +722,7 @@ export async function setForwarderFactory(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 async function setMockRealPoolKnownRoot(
@@ -627,7 +738,7 @@ async function setMockRealPoolKnownRoot(
     account: client.account!,
     chain: client.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await waitForL1Success(client, hash);
 }
 
 /**
@@ -637,38 +748,139 @@ async function setMockRealPoolKnownRoot(
  */
 export async function withdrawViaForwarder(
   stack: Pick<BridgeStack, 'l1Client' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
-  payload: { proof: `0x${string}`; root: `0x${string}`; nullifierHash: `0x${string}`; commitment: Fr; mintSecret: Fr },
+  payload: ForwarderPayload,
+): Promise<TornadoDeposit> {
+  try {
+    return await sendForwarderTx(stack, 'withdrawAndBridge', payload);
+  } catch (err) {
+    // The proof is public once broadcast: a front-runner may have replayed it directly against the
+    // pool (nullifier spent, ETH at the undeployed forwarder), and anyone may already have finished
+    // the bridge. Recover rather than losing the mint secret with the thrown error.
+    const existing = await findForwarderDeposit(stack, payload);
+    if (existing) {
+      return existing;
+    }
+    try {
+      return await sendForwarderTx(stack, 'bridgeSpentWithdrawal', payload);
+    } catch (recoveryErr) {
+      const raced = await findForwarderDeposit(stack, payload);
+      if (raced) {
+        return raced;
+      }
+      throw new ForwarderWithdrawalError(
+        `forwarder withdrawal failed (${errorMessage(err)}) and recovery failed (${errorMessage(recoveryErr)})`,
+        payload,
+      );
+    }
+  }
+}
+
+export interface ForwarderPayload {
+  proof: `0x${string}`;
+  root: `0x${string}`;
+  nullifierHash: `0x${string}`;
+  commitment: Fr;
+  mintSecret: Fr;
+}
+
+/**
+ * A forwarder withdrawal that could not be completed or located. `recovery` holds everything needed
+ * to retry `ForwarderFactory.bridgeSpentWithdrawal` and later claim -- persist it, especially
+ * `mintSecret`: without it the eventual L1->L2 message can never be claimed.
+ */
+export class ForwarderWithdrawalError extends Error {
+  constructor(
+    message: string,
+    readonly recovery: ForwarderPayload,
+  ) {
+    super(message);
+    this.name = 'ForwarderWithdrawalError';
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message.split('\n')[0] : String(err);
+}
+
+function toForwarderDeposit(
+  stack: Pick<BridgeStack, 'denomination'>,
+  payload: ForwarderPayload,
+  args: { nullifierHash: `0x${string}`; depositId: `0x${string}`; messageKey: `0x${string}`; messageLeafIndex: bigint },
+): TornadoDeposit {
+  return {
+    mintSecret: payload.mintSecret,
+    commitment: payload.commitment,
+    nullifierHash: args.nullifierHash,
+    depositId: args.depositId,
+    messageHash: Fr.fromHexString(args.messageKey),
+    messageLeafIndex: args.messageLeafIndex,
+    amount: stack.denomination,
+  };
+}
+
+type DepositLogArgs = {
+  nullifierHash: `0x${string}`;
+  depositId: `0x${string}`;
+  messageKey: `0x${string}`;
+  messageLeafIndex: bigint;
+};
+
+async function sendForwarderTx(
+  stack: Pick<BridgeStack, 'l1Client' | 'denomination'> & { factory: `0x${string}` },
+  functionName: 'withdrawAndBridge' | 'bridgeSpentWithdrawal',
+  payload: ForwarderPayload,
 ): Promise<TornadoDeposit> {
   const hash = await stack.l1Client.writeContract({
     address: stack.factory,
     abi: ForwarderFactoryAbi,
-    functionName: 'withdrawAndBridge',
+    functionName,
     args: [payload.proof, payload.root, payload.nullifierHash, payload.commitment.toString()],
     account: stack.l1Client.account!,
     chain: stack.l1Client.chain,
   });
-  const receipt = await stack.l1Client.waitForTransactionReceipt({ hash });
+  const receipt = await waitForL1Success(stack.l1Client, hash);
 
   const [log] = parseEventLogs({
     abi: TornadoEthBridgeL1Abi,
     logs: receipt.logs,
     eventName: 'TornadoBridgeDeposit',
-  }) as unknown as Array<{
-    args: { depositId: `0x${string}`; messageKey: `0x${string}`; messageLeafIndex: bigint };
-  }>;
+  }) as unknown as Array<{ args: DepositLogArgs }>;
   if (!log) {
     throw new Error('TornadoBridgeDeposit event not found in receipt');
   }
+  return toForwarderDeposit(stack, payload, log.args);
+}
 
-  return {
-    mintSecret: payload.mintSecret,
-    commitment: payload.commitment,
-    nullifierHash: payload.nullifierHash,
-    depositId: log.args.depositId,
-    messageHash: Fr.fromHexString(log.args.messageKey),
-    messageLeafIndex: log.args.messageLeafIndex,
-    amount: stack.denomination,
-  };
+/**
+ * Find a deposit the portal already registered for this commitment's forwarder (someone else may
+ * have completed the bridge). Prefers the deposit for our nullifier; any deposit through this
+ * forwarder mints to our commitment, so the latest one is the fallback.
+ */
+async function findForwarderDeposit(
+  stack: Pick<BridgeStack, 'l1Client' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
+  payload: ForwarderPayload,
+  lookbackBlocks = 10_000n,
+): Promise<TornadoDeposit | undefined> {
+  const forwarder = (await stack.l1Client.readContract({
+    address: stack.factory,
+    abi: ForwarderFactoryAbi,
+    functionName: 'computeForwarderAddress',
+    args: [payload.commitment.toString()],
+  })) as `0x${string}`;
+  const latest = await stack.l1Client.getBlockNumber();
+  const logs = (await stack.l1Client.getContractEvents({
+    address: stack.bridge,
+    abi: TornadoEthBridgeL1Abi,
+    eventName: 'TornadoBridgeDeposit',
+    args: { pool: forwarder },
+    fromBlock: latest > lookbackBlocks ? latest - lookbackBlocks : 0n,
+    toBlock: latest,
+  })) as unknown as Array<{ args: DepositLogArgs }>;
+  if (logs.length === 0) {
+    return undefined;
+  }
+  const ours = logs.find(l => l.args.nullifierHash.toLowerCase() === payload.nullifierHash.toLowerCase());
+  return toForwarderDeposit(stack, payload, (ours ?? logs[logs.length - 1]).args);
 }
 
 /**
@@ -695,43 +907,39 @@ export async function withdrawFromMockRealPool(
 }
 
 /**
- * Production real-path withdrawal: parse a real Tornado note, build its merkle proof against the live
- * pool, generate the Groth16 proof bound to the forwarder, and drive the factory. Requires the
- * canonical circuit artifacts (see {@link buildRealWithdrawalPayload}). The proof-packing must be
- * validated against the real verifier via the Tier 3 fork test before mainnet use.
+ * Real-path withdrawal: derive the forwarder from the Aztec mint commitment, generate a real Tornado
+ * Classic proof bound to it via a BYO tornado-cli (`opts.cliDir` = $TORNADO_CLI_DIR), and drive the
+ * factory. `opts.leaves` is the pool's ordered commitment set INCLUDING ours (for a freshly
+ * self-deployed pool whose only deposit is ours, just `[ourCommitment]`). The proof RUN needs
+ * tornado-cli installed -- the operator's consented step (see SECURITY.md); it is exercised only by
+ * the env-gated fork rehearsal, never by the offline suite.
  */
 export async function withdrawFromRealTornadoToBridge(
   stack: Pick<BridgeStack, 'l1Client' | 'bridge' | 'denomination'> & { factory: `0x${string}` },
   recipient: AztecAddress,
   note: string,
-  opts: { tornado?: `0x${string}`; mintSecret?: Fr; leaves?: bigint[]; wasmPath?: string; zkeyPath?: string } = {},
+  opts: { cliDir: string; leaves: Array<`0x${string}` | string>; mintSecret?: Fr },
 ): Promise<TornadoDeposit> {
   const forwarderInitCodeHash = (await stack.l1Client.readContract({
     address: stack.factory,
     abi: ForwarderFactoryAbi,
     functionName: 'FORWARDER_INIT_CODE_HASH',
   })) as `0x${string}`;
-  const tornado =
-    opts.tornado ??
-    ((await stack.l1Client.readContract({
-      address: stack.factory,
-      abi: ForwarderFactoryAbi,
-      functionName: 'TORNADO',
-    })) as `0x${string}`);
 
-  const payload = await buildRealWithdrawalPayload({
-    client: stack.l1Client,
-    tornado,
-    factory: stack.factory,
-    recipient,
-    amount: stack.denomination,
-    note,
-    mintSecret: opts.mintSecret,
+  const mintSecret = opts.mintSecret ?? generateMintSecret();
+  const commitment = await computeAztecMintCommitment(recipient, mintSecret, stack.denomination);
+  const forwarder = computeForwarderAddress(
+    stack.factory,
+    commitment.toString() as `0x${string}`,
     forwarderInitCodeHash,
+  );
+
+  const { proof, root, nullifierHash } = proveViaTornadoCli({
+    cliDir: opts.cliDir,
+    note,
+    recipient: forwarder,
     leaves: opts.leaves,
-    wasmPath: opts.wasmPath,
-    zkeyPath: opts.zkeyPath,
   });
 
-  return withdrawViaForwarder(stack, payload);
+  return withdrawViaForwarder(stack, { proof, root, nullifierHash, commitment, mintSecret });
 }

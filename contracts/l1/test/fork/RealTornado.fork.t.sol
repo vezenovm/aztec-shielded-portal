@@ -115,9 +115,28 @@ contract RealTornadoForkTest is Test {
     bytes32 nullifier = _freshNullifier(2);
     factory.withdrawAndBridge("", root, nullifier, COMMITMENT);
 
-    // The real pool's nullifier set rejects the replay (revert string from Tornado.sol).
-    vm.expectRevert(bytes("The note has been already spent"));
+    // The factory refuses a second bridge for the nullifier...
+    vm.expectRevert(abi.encodeWithSelector(ForwarderFactory.NullifierAlreadyBridged.selector, nullifier));
     factory.withdrawAndBridge("", root, nullifier, bytes32(uint256(0xc0ffef)));
+
+    // ...and the real pool's nullifier set rejects a direct replay (revert string from Tornado.sol).
+    address other = factory.computeForwarderAddress(bytes32(uint256(0xc0ffef)));
+    vm.expectRevert(bytes("The note has been already spent"));
+    pool.withdraw("", root, nullifier, payable(other), payable(address(0)), 0, 0);
+  }
+
+  function test_RecoversFrontRunOnRealPool() public onlyFork {
+    bytes32 root = pool.getLastRoot();
+    bytes32 nullifier = _freshNullifier(4);
+    address forwarder = factory.computeForwarderAddress(COMMITMENT);
+
+    // Front-runner submits the proof straight to the real pool: it pays the undeployed forwarder.
+    pool.withdraw("", root, nullifier, payable(forwarder), payable(address(0)), 0, 0);
+    assertEq(forwarder.balance, pool.denomination(), "real pool paid the forwarder address");
+
+    factory.bridgeSpentWithdrawal("", root, nullifier, COMMITMENT);
+    assertEq(bridge.totalLockedEth(), pool.denomination(), "stranded ETH bridged");
+    assertTrue(bridge.consumedDepositIds(_depositId(forwarder, nullifier, pool.denomination())));
   }
 
   function test_RevertWhen_RootUnknownOnRealPool() public onlyFork {

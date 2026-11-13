@@ -5,8 +5,8 @@
  *
  * Run: yarn test:aztec
  */
-import type { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
+import type { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { Fr } from '@aztec-labs/aztec.js/fields';
 import assert from 'node:assert/strict';
 import { before, describe, it } from 'node:test';
 

@@ -22,7 +22,7 @@ pub contract TornadoEthToken {
             functions::{external, initializer, view},
             storage::storage,
         },
-        messages::message_delivery::MessageDelivery,
+        messages::delivery::MessageDelivery,
         protocol::{
             address::{AztecAddress, EthAddress},
             hash::poseidon2_hash,
@@ -58,7 +58,7 @@ pub contract TornadoEthToken {
     /// The L1->L2 message was sent by the portal with
     ///   content    = sha256_to_field(selector ++ deposit_id ++ amount)
     ///   secretHash = aztecMintCommitment
-    ///              = compute_secret_hash(poseidon2([recipient, mint_secret, amount]))
+    ///              = compute_secret_hash([poseidon2([recipient, mint_secret, amount])])
     /// We recompute the commitment preimage from the *caller's* address, so consumption
     /// only succeeds for the recipient committed to at deposit time - the L1 side never
     /// learns that address. The message nullifier makes the claim single-use.
@@ -76,7 +76,7 @@ pub contract TornadoEthToken {
         let content_hash = get_claim_content_hash(deposit_id, amount);
         self.context.consume_l1_to_l2_message(
             content_hash,
-            inner_secret,
+            [inner_secret],
             self.storage.portal.read(),
             message_leaf_index,
         );

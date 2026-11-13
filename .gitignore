@@ -8,3 +8,4 @@ codegenCache.json
 config.local.json
 .tsbuildinfo
 *.log
+portal-state.json

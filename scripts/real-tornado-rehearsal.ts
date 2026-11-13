@@ -1,29 +1,30 @@
 /**
- * Tier 3 rehearsal: REAL Groth16 proof against the REAL Tornado verifier, on a mainnet fork.
+ * Real-Tornado rehearsal: a REAL Groth16 (circom1/websnark) proof, accepted by the REAL Tornado
+ * verifier, driving the full forwarder -> portal handoff -- on a mainnet fork, no real funds.
  *
- * This is the rung that proves our off-chain proof plumbing (public-signal ordering, pedersen/MiMC
- * derivations, proof packing) is byte-accepted by the actual mainnet verifier -- the one thing the
- * Tier 2 forge fork test mocks out. It is L1-only (the Aztec claim is the Phase 4 Sepolia rehearsal):
- * a fresh deposit into the forked pool, tree reconstruction, a real proof bound to the forwarder, and
- * the factory->portal handoff, asserting the bridge locked exactly the denomination.
+ * This is the rung that proves our off-chain proof plumbing (pedersen/MiMC derivations, public-signal
+ * ordering, the Groth16->Solidity proof packing) is byte-accepted by the actual mainnet verifier --
+ * the one thing the Tier 2 forge fork test mocks out. It is L1-only (the Aztec claim is exercised by
+ * the sandbox e2e + the Phase 4 Sepolia rehearsal).
  *
- * PREREQUISITES (none are bundled here):
- *   1. `anvil --fork-url $MAINNET_RPC_URL` running (or set L1_RPC_URL to a fork endpoint).
- *   2. The OPTIONAL toolchain installed: `yarn add -O snarkjs circomlibjs fixed-merkle-tree`.
- *   3. The CANONICAL tornado-core circuit artifacts, paths via env:
- *        TORNADO_WASM_PATH=/path/to/withdraw.wasm
- *        TORNADO_ZKEY_PATH=/path/to/withdraw_final.zkey
- *      (The mainnet verifier only accepts proofs from that exact trusted setup.)
- *   4. Optional: TORNADO_FROM_BLOCK to bound the Deposit-event scan (defaults near the pool's
- *      deployment); the full 1 ETH leaf set is large, so a tight range speeds reconstruction.
+ * Design (resolves "self-deployed pool" + "local anvil WITH fork"): we deploy our OWN `ETHTornado`
+ * on the fork, pointed at the REAL on-chain Verifier (+ the canonical MiMC hasher hardcoded at its
+ * mainnet address, present on the fork), deposit a single leaf we own, and prove against our fresh
+ * root. So we validate packing against the real verifier with NO mainnet leaf history.
  *
- * VALIDATE: if the real verifier rejects the proof, the most likely culprit is the Groth16->Solidity
- * proof packing in `packGroth16Proof` (src/real-tornado.ts) -- the pi_b element order in particular.
+ * PREREQUISITES (none are bundled here; running this is the operator's consented step -- see
+ * SECURITY.md):
+ *   1. A mainnet fork: `aztec-anvil --fork-url $MAINNET_RPC_URL` -- then set L1_RPC_URL to it.
+ *   2. A tornado-cli checkout with deps installed, and TORNADO_CLI_DIR pointing at it:
+ *        git clone https://github.com/tornadocash/tornado-cli && cd tornado-cli && npm install
+ *      (tornado-cli ships the circom1/websnark toolchain + the ETHTornado artifact we deploy from.)
+ *
+ * VALIDATE: if the real verifier rejects the proof, the most likely culprit is tornado-cli's proof
+ * packing assumptions vs our pinned tornado-cli commit -- re-pin tornado-cli, or compare against its
+ * own `withdraw` command output.
  */
-import { AztecAddress } from '@aztec/aztec.js/addresses';
-import { Fr } from '@aztec/aztec.js/fields';
-import { deployL1Contract } from '@aztec/ethereum/deploy-l1-contract';
-import { EthAddress } from '@aztec/foundation/eth-address';
+import { AztecAddress } from '@aztec-labs/aztec.js/addresses';
+import { EthAddress } from '@aztec-labs/foundation/eth-address';
 import { type Abi, parseAbi } from 'viem';
 
 import MockInboxJson from '../contracts/l1/out/MessagingMocks.sol/MockInbox.json' with { type: 'json' };
@@ -32,27 +33,30 @@ import MockRegistryJson from '../contracts/l1/out/MessagingMocks.sol/MockRegistr
 import MockRollupJson from '../contracts/l1/out/MessagingMocks.sol/MockRollup.json' with { type: 'json' };
 import {
   deployForwarderFactory,
+  deployOwnTornadoPool,
   deployTornadoBridge,
   getTotalLockedEth,
   initializeBridge,
   makeL1Client,
   ONE_ETH,
+  readTornadoVerifier,
   setForwarderFactory,
   TEST_MNEMONIC,
   withdrawFromRealTornadoToBridge,
   type L1Client,
+  deployL1ContractChecked,
+  waitForL1Success,
 } from '../src/index.js';
-import { fetchDepositLeaves, generateTornadoNote, TORNADO_1ETH_MAINNET } from '../src/real-tornado.js';
+import { createTornadoNoteViaCli, TORNADO_1ETH_MAINNET } from '../src/real-tornado.js';
 
-const POOL_DEPLOY_BLOCK_DEFAULT = 9_117_000n;
+const tornadoDepositAbi = parseAbi(['function deposit(bytes32 _commitment) external payable']);
 
-const tornadoAbi = parseAbi([
-  'function deposit(bytes32 _commitment) external payable',
-  'function getLastRoot() external view returns (bytes32)',
-]);
-
-function toBytes32(value: bigint): `0x${string}` {
-  return `0x${value.toString(16).padStart(64, '0')}`;
+function requireEnv(name: string, hint: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is required (${hint})`);
+  }
+  return value;
 }
 
 async function deployMock(
@@ -60,64 +64,85 @@ async function deployMock(
   json: { abi: unknown; bytecode: { object: string } },
   args: unknown[],
 ): Promise<`0x${string}`> {
-  const { address } = await deployL1Contract(client, json.abi as Abi, json.bytecode.object as `0x${string}`, args);
-  return address.toString() as `0x${string}`;
+  return deployL1ContractChecked(client, json.abi as Abi, json.bytecode.object as `0x${string}`, args);
 }
 
 export interface RehearsalResult {
   bridge: `0x${string}`;
   factory: `0x${string}`;
+  ownTornado: `0x${string}`;
   lockedEth: bigint;
   depositId: `0x${string}`;
 }
 
+/**
+ * Refuse to run anywhere but an Anvil mainnet fork. The rehearsal deploys contracts and deposits
+ * 1 ETH from the signer (which may come from L1_PRIVATE_KEY/L1_MNEMONIC), so a live endpoint would
+ * spend real funds.
+ */
+async function assertAnvilFork(client: L1Client): Promise<void> {
+  const rpc = client as unknown as { request(args: { method: string }): Promise<unknown> };
+  let info: { forkConfig?: { forkUrl?: string | null } };
+  try {
+    info = (await rpc.request({ method: 'anvil_nodeInfo' })) as typeof info;
+  } catch {
+    throw new Error('L1_RPC_URL is not an Anvil node. The rehearsal only runs on `aztec-anvil --fork-url <mainnet>`.');
+  }
+  if (!info?.forkConfig?.forkUrl) {
+    throw new Error('L1_RPC_URL is Anvil but not a fork. Start it with `aztec-anvil --fork-url <mainnet>`.');
+  }
+}
+
 export async function runRealTornadoRehearsal(
-  opts: { rpcUrl?: string; chainId?: number; tornado?: `0x${string}`; fromBlock?: bigint } = {},
+  opts: { rpcUrl?: string; chainId?: number; cliDir?: string; realPool?: `0x${string}` } = {},
 ): Promise<RehearsalResult> {
-  const tornado = opts.tornado ?? TORNADO_1ETH_MAINNET;
+  const cliDir = opts.cliDir ?? requireEnv('TORNADO_CLI_DIR', 'a tornado-cli checkout with deps installed');
   const client = makeL1Client({
-    rpcUrl: opts.rpcUrl ?? process.env.L1_RPC_URL ?? 'http://localhost:8545',
+    rpcUrl: opts.rpcUrl ?? requireEnv('L1_RPC_URL', 'a mainnet fork endpoint, e.g. aztec-anvil --fork-url'),
     chainId: opts.chainId ?? Number(process.env.L1_CHAIN_ID ?? 1),
     mnemonic: process.env.L1_MNEMONIC ?? TEST_MNEMONIC,
   });
+  await assertAnvilFork(client);
 
-  // 1. L1-only Aztec messaging stubs + the bridge wired to them.
-  console.log('Deploying messaging mocks + bridge on the fork...');
+  // 1. Our own ETHTornado on the fork, pointed at the REAL verifier read from the canonical pool.
+  const realPool = opts.realPool ?? TORNADO_1ETH_MAINNET;
+  const verifier = await readTornadoVerifier(client, realPool);
+  console.log(`Deploying our own ETHTornado (verifier=${verifier}) on the fork...`);
+  const ownTornado = await deployOwnTornadoPool(client, cliDir, { verifier });
+
+  // 2. A fresh note (via tornado-cli's pedersen), deposited so we own the only leaf.
+  console.log('Generating + depositing a fresh Tornado note...');
+  const { note, commitment } = createTornadoNoteViaCli(cliDir);
+  const depositHash = await client.writeContract({
+    address: ownTornado,
+    abi: tornadoDepositAbi,
+    functionName: 'deposit',
+    args: [commitment],
+    value: ONE_ETH,
+    account: client.account!,
+    chain: client.chain,
+  });
+  await waitForL1Success(client, depositHash);
+
+  // 3. L1-only Aztec messaging stubs + the bridge + a forwarder factory pointed at our pool.
+  console.log('Deploying messaging mocks + bridge + forwarder factory...');
   const inbox = await deployMock(client, MockInboxJson, []);
   const outbox = await deployMock(client, MockOutboxJson, []);
   const rollup = await deployMock(client, MockRollupJson, [inbox, outbox, 1n]);
   const registry = await deployMock(client, MockRegistryJson, [rollup]);
   const bridge = await deployTornadoBridge(client);
-  await initializeBridge(client, bridge, EthAddress.fromString(registry), AztecAddress.fromField(new Fr(0x1234n)));
-
-  // 2. Forwarder factory pointed at the REAL pool, approved on the bridge.
-  const factory = await deployForwarderFactory(client, bridge, tornado);
+  await initializeBridge(client, bridge, EthAddress.fromString(registry), await AztecAddress.random());
+  const factory = await deployForwarderFactory(client, bridge, ownTornado);
   await setForwarderFactory(client, bridge, factory);
 
-  // 3. Fresh Tornado note + deposit into the forked pool so we own a leaf.
-  console.log('Generating + depositing a fresh Tornado note...');
-  const { note, commitment } = await generateTornadoNote();
-  const depositHash = await client.writeContract({
-    address: tornado,
-    abi: tornadoAbi,
-    functionName: 'deposit',
-    args: [toBytes32(commitment)],
-    value: ONE_ETH,
-    account: client.account!,
-    chain: client.chain,
-  });
-  await client.waitForTransactionReceipt({ hash: depositHash });
-
-  // 4. Real proof -> forwarder -> portal. Reconstruct the tree from Deposit events (bounded by
-  // fromBlock to keep the scan tractable), then generate + submit the real proof.
-  console.log('Reconstructing tree, generating the real proof, and bridging...');
-  const leaves = await fetchDepositLeaves(client, tornado, { fromBlock: opts.fromBlock ?? POOL_DEPLOY_BLOCK_DEFAULT });
-  const recipient = AztecAddress.fromField(new Fr(0xabcdefn));
+  // 4. Real proof bound to the forwarder -> factory -> portal. Our pool's only leaf is ours.
+  console.log('Generating the real proof and bridging...');
+  const recipient = await AztecAddress.random();
   const deposit = await withdrawFromRealTornadoToBridge(
     { l1Client: client, bridge, denomination: ONE_ETH, factory },
     recipient,
     note,
-    { tornado, leaves },
+    { cliDir, leaves: [commitment] },
   );
 
   const lockedEth = await getTotalLockedEth(client, bridge);
@@ -126,13 +151,12 @@ export async function runRealTornadoRehearsal(
   }
   console.log(`OK: real proof accepted, bridge locked ${lockedEth} wei (depositId ${deposit.depositId}).`);
 
-  return { bridge, factory, lockedEth, depositId: deposit.depositId };
+  return { bridge, factory, ownTornado, lockedEth, depositId: deposit.depositId };
 }
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  const fromBlock = process.env.TORNADO_FROM_BLOCK ? BigInt(process.env.TORNADO_FROM_BLOCK) : POOL_DEPLOY_BLOCK_DEFAULT;
-  runRealTornadoRehearsal({ fromBlock })
+  runRealTornadoRehearsal()
     .then(() => process.exit(0))
     .catch(err => {
       console.error(err);
